@@ -871,6 +871,9 @@ impl TrafficSimulation {
             }
             self.elevators = synchronized;
             settle_people_after_shaft_changes(&mut self.elevators, &mut self.people, &renumbered);
+            for person in &mut self.away {
+                renumber_person_shafts(person, &renumbered);
+            }
         }
 
         if topology_changed {
@@ -3930,6 +3933,33 @@ mod tests {
         )));
         assert_eq!(traffic.elevators[0].cars[0].passengers, vec![1]);
         assert!(traffic.validate_save_state(&tower).is_ok());
+    }
+
+    #[test]
+    fn demolishing_a_shafts_lowest_segment_renumbers_away_residents_way_home() {
+        let (mut tower, mut traffic, segments) = shaft_with_offices(4);
+        let old_id = traffic.elevators[0].id;
+        let home = tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.kind == FacilityKind::Office && facility.position.floor == 3)
+            .unwrap()
+            .clone();
+        let lobby_route = TravelMode::Elevator {
+            shaft_id: old_id,
+            x: shaft_center(&traffic.elevators[0]),
+        };
+        traffic.away.push(resident_out(1, &home, lobby_route, 30.0));
+
+        let removed = tower.demolish(segments[0]).unwrap();
+        traffic.sync_with_tower_after_removal(&tower, &removed);
+
+        let new_id = traffic.elevators[0].id;
+        assert_ne!(new_id, old_id);
+        assert!(matches!(
+            traffic.away[0].route,
+            TravelMode::Elevator { shaft_id, .. } if shaft_id == new_id
+        ));
     }
 
     #[test]
