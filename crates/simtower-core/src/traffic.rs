@@ -163,6 +163,14 @@ impl Person {
     pub const fn is_returning_home(&self) -> bool {
         self.going_home
     }
+
+    /// Whether the person has reached the street on an outside trip that has not ended yet.
+    fn is_away(&self) -> bool {
+        self.activity == PersonActivity::Visiting
+            && self.destination_facility_id == 0
+            && !self.going_home
+            && self.visit_remaining > 0.0
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
@@ -212,6 +220,11 @@ enum TopologySync {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct TrafficSimulation {
     people: Vec<Person>,
+    /// Residents out of the tower on an outside trip (at work, at school, or out for a service
+    /// the tower lacks), in the order they left. They are not in the tower, so they hold no
+    /// `MAX_SIMULATED_PEOPLE` slot until they come back in.
+    #[serde(default)]
+    away: Vec<Person>,
     elevators: Vec<ElevatorShaft>,
     arrived_facilities: HashSet<u64>,
     #[serde(default)]
@@ -258,6 +271,7 @@ impl Default for TrafficSimulation {
     fn default() -> Self {
         Self {
             people: Vec::new(),
+            away: Vec::new(),
             elevators: Vec::new(),
             arrived_facilities: HashSet::new(),
             reachable_facilities: HashSet::new(),
@@ -287,6 +301,12 @@ impl TrafficSimulation {
 
     pub fn people(&self) -> &[Person] {
         &self.people
+    }
+
+    /// Residents currently out of the tower on an outside trip. They come back into
+    /// [`Self::people`] when the trip ends.
+    pub fn away_people(&self) -> &[Person] {
+        &self.away
     }
 
     pub fn take_parking_demand_warning(&mut self) -> bool {
@@ -339,8 +359,17 @@ impl TrafficSimulation {
             }
         }
         let mut person_ids = HashSet::new();
-        for person in &self.people {
+        let everyone = self
+            .people
+            .iter()
+            .map(|person| (person, false))
+            .chain(self.away.iter().map(|person| (person, true)));
+        for (person, listed_away) in everyone {
             if person.id == 0
+                || (listed_away
+                    && (person.activity != PersonActivity::Visiting
+                        || person.destination_facility_id != 0
+                        || person.going_home))
                 || !person_ids.insert(person.id)
                 || !person.x.is_finite()
                 || !person.floor_position.is_finite()
@@ -932,11 +961,13 @@ impl TrafficSimulation {
             .iter()
             .map(|facility| facility.id)
             .collect();
-        self.people.retain(|person| {
+        let still_placed = |person: &Person| {
             (person.home_facility_id == 0 || live_facilities.contains(&person.home_facility_id))
                 && (person.destination_facility_id == 0
                     || live_facilities.contains(&person.destination_facility_id))
-        });
+        };
+        self.people.retain(still_placed);
+        self.away.retain(still_placed);
         self.scheduled_trip_days
             .retain(|key, _| live_facilities.contains(&(key >> 5)));
         self.commercial_patronage
@@ -1046,7 +1077,35 @@ impl TrafficSimulation {
                 && (person.activity == PersonActivity::LeavingElevatorQueue
                     || (person.going_home && person.activity == PersonActivity::Visiting)))
         });
+        self.bring_residents_back(elapsed_seconds);
+        self.send_residents_away();
         self.refresh_current_visitors();
+    }
+
+    /// Moves residents who have reached the street on an outside trip to `away`. A school day
+    /// or a working day keeps them out for hours, and kept among `people` they filled every
+    /// slot each morning in a tower with many condos, so no visitor or office worker could
+    /// arrive until they came home. The original gives each tenant its own fixed occupants, so
+    /// one tenant's absent residents never crowd out another's.
+    fn send_residents_away(&mut self) {
+        self.away
+            .extend(self.people.extract_if(.., |person| person.is_away()));
+    }
+
+    /// Counts down the trips of residents who are away and lets those whose trip has ended back
+    /// in at the street, longest-gone first, while the tower has room. Their visit is over, so
+    /// they head home on the next tick like anyone else.
+    fn bring_residents_back(&mut self, elapsed_seconds: f32) {
+        for person in &mut self.away {
+            person.visit_remaining -= elapsed_seconds;
+        }
+        let room = MAX_SIMULATED_PEOPLE.saturating_sub(self.people.len());
+        let mut due = 0;
+        self.people.extend(self.away.extract_if(.., |person| {
+            let returning = person.visit_remaining <= 0.0 && due < room;
+            due += usize::from(returning);
+            returning
+        }));
     }
 
     fn advance_commercial_patronage(&mut self, tower: &Tower) {
@@ -4001,6 +4060,132 @@ mod tests {
                 .iter()
                 .all(|person| person.home_facility_id == 0)
         );
+    }
+
+    /// A resident of `home` standing at the street partway through an outside trip, the state
+    /// a school or work trip reaches once the resident has walked out.
+    fn resident_out(id: u64, home: &Facility, lobby_route: TravelMode, remaining: f32) -> Person {
+        let street = Endpoint {
+            facility_id: 0,
+            x: 0.0,
+            floor: 1,
+        };
+        Person {
+            id,
+            role: PersonRole::Salesman,
+            home_facility_id: home.id,
+            destination_facility_id: 0,
+            x: street.x,
+            floor_position: 0.0,
+            current_floor: 1,
+            mood: PersonMood::Calm,
+            activity: PersonActivity::Visiting,
+            wait_seconds: 0.0,
+            origin: endpoint(home),
+            destination: street,
+            route: reverse_route(lobby_route),
+            going_home: false,
+            walking_from_transport: false,
+            visit_remaining: remaining,
+            visit_duration: remaining,
+            stair_progress: 0.0,
+            route_leg: 0,
+        }
+    }
+
+    fn office_and_lobby_route(
+        tower: &Tower,
+        traffic: &TrafficSimulation,
+    ) -> (Facility, TravelMode) {
+        let office = tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.kind == FacilityKind::Office)
+            .unwrap()
+            .clone();
+        let route = *traffic.routes_from_lobby.get(&office.id).unwrap();
+        (office, route)
+    }
+
+    #[test]
+    fn residents_out_for_the_day_leave_room_for_office_workers() {
+        let tower = traffic_tower(true);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let (office, route) = office_and_lobby_route(&tower, &traffic);
+        // A full cap's worth of residents at work or school for the whole test.
+        for id in 1..=MAX_SIMULATED_PEOPLE as u64 {
+            traffic
+                .people
+                .push(resident_out(id, &office, route, 10_000.0));
+        }
+        traffic.next_person_id = MAX_SIMULATED_PEOPLE as u64 + 1;
+
+        for _ in 0..800 {
+            traffic.advance(&tower, 0.25);
+        }
+
+        assert_eq!(traffic.away.len(), MAX_SIMULATED_PEOPLE);
+        assert!(traffic.visitors_at(office.id) > 0);
+        assert_eq!(traffic.validate_save_state(&tower), Ok(()));
+    }
+
+    #[test]
+    fn residents_wait_outside_until_the_tower_has_room_for_them() {
+        let tower = traffic_tower(true);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let (office, route) = office_and_lobby_route(&tower, &traffic);
+        traffic.away.push(resident_out(1, &office, route, 0.5));
+        for id in 2..=MAX_SIMULATED_PEOPLE as u64 + 1 {
+            let mut visitor = resident_out(id, &office, route, 10_000.0);
+            visitor.home_facility_id = 0;
+            visitor.destination_facility_id = office.id;
+            traffic.people.push(visitor);
+        }
+        traffic.next_person_id = MAX_SIMULATED_PEOPLE as u64 + 2;
+
+        for _ in 0..8 {
+            traffic.advance(&tower, 0.25);
+        }
+        assert_eq!(traffic.away.len(), 1);
+        assert_eq!(traffic.people.len(), MAX_SIMULATED_PEOPLE);
+
+        traffic.people.pop();
+        traffic.advance(&tower, 0.25);
+        traffic.advance(&tower, 0.25);
+        assert!(traffic.away.is_empty());
+        let resident = traffic.people.iter().find(|person| person.id == 1).unwrap();
+        assert!(resident.is_returning_home());
+        assert_eq!(resident.activity, PersonActivity::Walking);
+    }
+
+    #[test]
+    fn saves_keep_away_residents_and_reject_impossible_ones() {
+        let tower = traffic_tower(true);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let (office, route) = office_and_lobby_route(&tower, &traffic);
+        traffic.away.push(resident_out(1, &office, route, 30.0));
+        traffic.next_person_id = 2;
+        assert_eq!(traffic.validate_save_state(&tower), Ok(()));
+
+        traffic.away[0].activity = PersonActivity::Walking;
+        assert!(traffic.validate_save_state(&tower).is_err());
+    }
+
+    #[test]
+    fn demolishing_an_away_residents_home_drops_them() {
+        let mut tower = traffic_tower(true);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let (office, route) = office_and_lobby_route(&tower, &traffic);
+        traffic.away.push(resident_out(1, &office, route, 30.0));
+
+        let removed = tower.demolish(office.id).unwrap();
+        traffic.sync_with_tower_after_removal(&tower, &removed);
+
+        assert!(traffic.away.is_empty());
     }
 
     #[test]
