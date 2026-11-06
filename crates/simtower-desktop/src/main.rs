@@ -3511,6 +3511,7 @@ impl App {
             .traffic
             .people()
             .iter()
+            .chain(self.traffic.away_people())
             .map(|person| person.id)
             .collect::<HashSet<_>>();
         self.visual_people_x
