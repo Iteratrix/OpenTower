@@ -6769,14 +6769,9 @@ impl App {
                     .iter()
                     .any(|car| car.home_floor == facility.position.floor)
             });
-            self.draw_empty_elevator_shaft(
-                x,
-                y,
-                width,
-                facility.position.floor,
-                visible,
-                default_waiting_floor,
-            );
+            let label = elevator_floor_is_labelled(&self.traffic, &self.tower, facility)
+                .then_some(facility.position.floor);
+            self.draw_empty_elevator_shaft(x, y, width, label, visible, default_waiting_floor);
             return;
         }
         let floors = f32::from(facility.kind.spec().height);
@@ -6996,7 +6991,7 @@ impl App {
         x: f32,
         y: f32,
         width: f32,
-        floor: i16,
+        label: Option<i16>,
         visible: bool,
         default_waiting_floor: bool,
     ) {
@@ -7022,7 +7017,9 @@ impl App {
         // Resources 2024-2026 are the light-gray shaft designations;
         // 2027-2029 are their original light-pink default-floor counterparts.
         // Cars are drawn later and naturally cover the label.
-        self.draw_elevator_floor_number(floor, x, y, width, tint, default_waiting_floor);
+        if let Some(floor) = label {
+            self.draw_elevator_floor_number(floor, x, y, width, tint, default_waiting_floor);
+        }
     }
 
     fn draw_elevator_floor_number(
@@ -11590,6 +11587,15 @@ fn elevator_compound_label_backplate(x: f32, y: f32, shaft_width: f32) -> Rect {
     Rect::new(x + (shaft_width - 32.0) * 0.5, y, 32.0, 36.0)
 }
 
+/// Whether a shaft cell shows its floor number. Only floors the cars stop at are numbered, so
+/// an express shaft labels its basement, lobby and sky-lobby stops and leaves the floors it
+/// passes blank.
+fn elevator_floor_is_labelled(traffic: &TrafficSimulation, tower: &Tower, cell: &Facility) -> bool {
+    traffic
+        .elevator_at(cell.kind, cell.position.x)
+        .is_none_or(|shaft| traffic.elevator_can_stop_at(tower, shaft.id, cell.position.floor))
+}
+
 fn person_stress_fraction(person: &Person) -> f32 {
     person_stress_for(person.mood, person.wait_seconds)
 }
@@ -14598,6 +14604,51 @@ mod tests {
         assert_eq!(
             elevator_compound_label_backplate(100.0, 72.0, 32.0),
             Rect::new(100.0, 72.0, 32.0, 36.0)
+        );
+    }
+
+    #[test]
+    fn shafts_number_only_the_floors_their_cars_stop_at() {
+        let mut tower = Tower::new(64, 1_000_000_000);
+        for floor in 1..=16 {
+            for x in 0..64 {
+                tower.place_floor(GridPosition { x, floor }).unwrap();
+            }
+        }
+        for floor in [1, 15] {
+            for x in (0..20).step_by(usize::from(FacilityKind::Lobby.spec().width)) {
+                tower
+                    .place(FacilityKind::Lobby, GridPosition { x, floor })
+                    .unwrap();
+            }
+        }
+        for floor in 1..=16 {
+            tower
+                .place(FacilityKind::ExpressElevator, GridPosition { x: 20, floor })
+                .unwrap();
+            tower
+                .place(FacilityKind::Elevator, GridPosition { x: 40, floor })
+                .unwrap();
+        }
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+
+        let labelled = |kind: FacilityKind| {
+            let mut floors = tower
+                .facilities()
+                .iter()
+                .filter(|cell| {
+                    cell.kind == kind && elevator_floor_is_labelled(&traffic, &tower, cell)
+                })
+                .map(|cell| cell.position.floor)
+                .collect::<Vec<_>>();
+            floors.sort_unstable();
+            floors
+        };
+        assert_eq!(labelled(FacilityKind::ExpressElevator), vec![1, 15]);
+        assert_eq!(
+            labelled(FacilityKind::Elevator),
+            (1..=16).collect::<Vec<_>>()
         );
     }
 
