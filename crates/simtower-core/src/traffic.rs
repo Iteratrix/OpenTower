@@ -759,6 +759,7 @@ impl TrafficSimulation {
         let destinations_changed = self.known_destinations != destination_ids;
         if !topology_changed && !destinations_changed {
             normalize_elevator_home_floors(&mut self.elevators, tower.facilities());
+            release_departed_passengers(&mut self.elevators, &self.people);
             return;
         }
 
@@ -937,6 +938,7 @@ impl TrafficSimulation {
                 && (person.destination_facility_id == 0
                     || live_facilities.contains(&person.destination_facility_id))
         });
+        release_departed_passengers(&mut self.elevators, &self.people);
         self.scheduled_trip_days
             .retain(|key, _| live_facilities.contains(&(key >> 5)));
         self.commercial_patronage
@@ -2479,6 +2481,28 @@ fn normalize_elevator_home_floors(elevators: &mut [ElevatorShaft], facilities: &
     }
 }
 
+/// Keeps only the passengers who are still riding the car's shaft. Demolishing a tenant removes
+/// its people even mid-ride, and an id left behind would hold a car place for good, since only
+/// a rider's own arrival frees it. The original's teardown likewise removes a cancelled
+/// request from every active route slot. Older saves can already carry such ids, and loading
+/// syncs, so this also repairs them.
+fn release_departed_passengers(elevators: &mut [ElevatorShaft], people: &[Person]) {
+    let riders = people
+        .iter()
+        .filter_map(|person| match person.activity {
+            PersonActivity::RidingElevator { shaft_id } => Some((shaft_id, person.id)),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    for shaft in elevators {
+        let shaft_id = shaft.id;
+        for car in &mut shaft.cars {
+            car.passengers
+                .retain(|id| riders.contains(&(shaft_id, *id)));
+        }
+    }
+}
+
 fn floor_is_inside_multistory_lobby(
     floor: i16,
     transport_x: u16,
@@ -3222,6 +3246,80 @@ mod tests {
         assert!(!traffic.routes_from_lobby.contains_key(&upper_office));
         assert!(traffic.reachable_facilities.contains(&lower_office));
         assert!(!traffic.reachable_facilities.contains(&upper_office));
+    }
+
+    #[test]
+    fn demolishing_a_tenant_frees_the_car_places_of_its_riders() {
+        let mut tower = traffic_tower(true);
+        let office = tower
+            .facilities()
+            .iter()
+            .find(|facility| facility.kind == FacilityKind::Office)
+            .unwrap()
+            .clone();
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let route = *traffic.routes_from_lobby.get(&office.id).unwrap();
+        let TravelMode::Elevator { shaft_id, x } = route else {
+            panic!("expected an elevator route, got {route:?}");
+        };
+        let origin = Endpoint {
+            facility_id: 0,
+            x,
+            floor: 1,
+        };
+        traffic.people.push(Person {
+            id: 1,
+            role: PersonRole::Visitor,
+            home_facility_id: 0,
+            destination_facility_id: office.id,
+            x,
+            floor_position: 0.5,
+            current_floor: 1,
+            mood: PersonMood::Calm,
+            activity: PersonActivity::RidingElevator { shaft_id },
+            wait_seconds: 0.0,
+            origin,
+            destination: endpoint(&office),
+            route,
+            going_home: false,
+            walking_from_transport: false,
+            visit_remaining: 0.0,
+            visit_duration: 1.0,
+            stair_progress: 0.0,
+            route_leg: 0,
+        });
+        traffic.elevator_mut(shaft_id).unwrap().cars[0]
+            .passengers
+            .push(1);
+
+        let removed = tower.demolish(office.id).unwrap();
+        traffic.sync_with_tower_after_removal(&tower, &removed);
+
+        assert!(traffic.people.is_empty());
+        assert!(
+            traffic.elevator_mut(shaft_id).unwrap().cars[0]
+                .passengers
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn syncing_frees_car_places_held_by_people_who_are_gone() {
+        let tower = traffic_tower(true);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let shaft_id = traffic.elevators[0].id;
+        traffic.elevators[0].cars[0].passengers.push(42);
+
+        // Loading a save syncs without any topology change, which must still repair it.
+        traffic.sync_with_tower(&tower);
+
+        assert!(
+            traffic.elevator_mut(shaft_id).unwrap().cars[0]
+                .passengers
+                .is_empty()
+        );
     }
 
     #[test]
