@@ -18,6 +18,9 @@ pub const MAX_STAIR_FLIGHTS: u16 = 4;
 /// direction before their route is considered impractical.
 pub const MAX_ESCALATOR_FLIGHTS: u16 = 3;
 const QUEUE_ABANDON_WALK_SECONDS: f32 = 4.0;
+/// Route-score surcharge for changing transport at a lobby, between two elevators or between
+/// an elevator and stairs or an escalator.
+const TRANSFER_PENALTY: f32 = 30.0;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PersonMood {
@@ -188,6 +191,22 @@ enum TravelMode {
     },
     Stairs {
         x: f32,
+    },
+    /// An elevator ride to a lobby floor, then stairs or an escalator from that lobby to the
+    /// destination floor.
+    ElevatorThenWalkway {
+        shaft_id: u64,
+        shaft_x: f32,
+        transfer_floor: i16,
+        walkway_x: f32,
+    },
+    /// Stairs or an escalator to a lobby floor, then an elevator ride from that lobby to the
+    /// destination floor. The reverse of [`TravelMode::ElevatorThenWalkway`].
+    WalkwayThenElevator {
+        walkway_x: f32,
+        transfer_floor: i16,
+        shaft_id: u64,
+        shaft_x: f32,
     },
 }
 
@@ -429,7 +448,9 @@ impl TrafficSimulation {
             return 0;
         };
         let uses_express = match route {
-            TravelMode::Elevator { shaft_id, .. } => self
+            TravelMode::Elevator { shaft_id, .. }
+            | TravelMode::ElevatorThenWalkway { shaft_id, .. }
+            | TravelMode::WalkwayThenElevator { shaft_id, .. } => self
                 .elevators
                 .iter()
                 .any(|shaft| shaft.id == shaft_id && shaft.kind == FacilityKind::ExpressElevator),
@@ -449,8 +470,6 @@ impl TrafficSimulation {
 
         let destination_x = endpoint(facility).x;
         let transport_x = match route {
-            TravelMode::Elevator { x, .. } | TravelMode::Stairs { x } => Some(x),
-            TravelMode::ElevatorTransfer { second_x, .. } => Some(second_x),
             TravelMode::SameFloor => tower
                 .facilities()
                 .iter()
@@ -464,6 +483,7 @@ impl TrafficSimulation {
                         .abs()
                         .total_cmp(&(destination_x - *right).abs())
                 }),
+            route => final_transport_x(route),
         };
         let Some(transport_x) = transport_x else {
             return 0;
@@ -1648,6 +1668,24 @@ fn advance_people(people: &mut [Person], elapsed_seconds: f32) {
                                 second_x
                             }
                         }
+                        TravelMode::ElevatorThenWalkway {
+                            shaft_x, walkway_x, ..
+                        } => {
+                            if person.route_leg == 0 {
+                                shaft_x
+                            } else {
+                                walkway_x
+                            }
+                        }
+                        TravelMode::WalkwayThenElevator {
+                            walkway_x, shaft_x, ..
+                        } => {
+                            if person.route_leg == 0 {
+                                walkway_x
+                            } else {
+                                shaft_x
+                            }
+                        }
                     }
                 };
                 person.x = move_toward(person.x, target, elapsed_seconds * 8.0);
@@ -1673,7 +1711,19 @@ fn advance_people(people: &mut [Person], elapsed_seconds: f32) {
                                     },
                                 };
                             }
-                            TravelMode::Stairs { .. } => {
+                            TravelMode::ElevatorThenWalkway { shaft_id, .. }
+                                if person.route_leg == 0 =>
+                            {
+                                person.activity = PersonActivity::WaitingForElevator { shaft_id };
+                            }
+                            TravelMode::WalkwayThenElevator { shaft_id, .. }
+                                if person.route_leg == 1 =>
+                            {
+                                person.activity = PersonActivity::WaitingForElevator { shaft_id };
+                            }
+                            TravelMode::Stairs { .. }
+                            | TravelMode::ElevatorThenWalkway { .. }
+                            | TravelMode::WalkwayThenElevator { .. } => {
                                 person.activity = PersonActivity::UsingStairs;
                                 person.stair_progress = 0.0;
                             }
@@ -1694,14 +1744,14 @@ fn advance_people(people: &mut [Person], elapsed_seconds: f32) {
             PersonActivity::RidingElevator { .. } => {}
             PersonActivity::UsingStairs => {
                 person.stair_progress = (person.stair_progress + elapsed_seconds * 0.7).min(1.0);
-                let destination = trip_destination(person);
+                let leg_end_floor = walkway_leg_end_floor(person);
                 let start = f32::from(floor_ordinal(person.current_floor));
-                let end = f32::from(floor_ordinal(destination.floor));
+                let end = f32::from(floor_ordinal(leg_end_floor));
                 person.floor_position = start + (end - start) * person.stair_progress;
                 if person.stair_progress >= 1.0 {
-                    person.current_floor = destination.floor;
+                    person.current_floor = leg_end_floor;
                     person.floor_position = end;
-                    person.walking_from_transport = true;
+                    finish_leg(person);
                     person.activity = PersonActivity::Walking;
                 }
             }
@@ -1867,12 +1917,7 @@ fn unload_people(
         person.current_floor = floor;
         person.floor_position = f32::from(floor_ordinal(floor));
         person.x = f32::from(shaft_x) + 2.0;
-        if matches!(person.route, TravelMode::ElevatorTransfer { .. }) && person.route_leg == 0 {
-            person.route_leg = 1;
-            person.walking_from_transport = false;
-        } else {
-            person.walking_from_transport = true;
-        }
+        finish_leg(person);
         person.activity = PersonActivity::Walking;
     }
     car.passengers.retain(|id| !departing.contains(id));
@@ -2060,14 +2105,35 @@ fn route_from_first_floor_lobby(
     facilities: &[Facility],
     floors: &[GridPosition],
 ) -> Option<TravelMode> {
-    facilities
+    let lobbies = facilities
         .iter()
         .filter(|facility| facility.kind == FacilityKind::Lobby && facility.position.floor == 1)
-        .filter_map(|lobby| {
-            choose_route_scored(endpoint(lobby), destination, elevators, facilities, floors)
+        .collect::<Vec<_>>();
+    // Every lobby slice is an alternative start, so the elevator-and-walkway fallback applies
+    // only when no slice has a simpler route; otherwise a slice that only has the fallback could
+    // outscore a direct route from another slice.
+    let best_from_any_slice = |search: &dyn Fn(Endpoint) -> Option<(TravelMode, f32)>| {
+        lobbies
+            .iter()
+            .filter_map(|lobby| search(endpoint(lobby)))
+            .min_by(|left, right| left.1.total_cmp(&right.1))
+    };
+    best_from_any_slice(&|origin| {
+        choose_route_scored_for(
+            origin,
+            destination,
+            elevators,
+            facilities,
+            floors,
+            ElevatorAccess::Public,
+        )
+    })
+    .or_else(|| {
+        best_from_any_slice(&|origin| {
+            choose_walkway_transfer(origin, destination, elevators, facilities, floors)
         })
-        .min_by(|left, right| left.1.total_cmp(&right.1))
-        .map(|(route, _)| route)
+    })
+    .map(|(route, _)| route)
 }
 
 fn route_uses_removed_walkway(
@@ -2077,8 +2143,24 @@ fn route_uses_removed_walkway(
     removed_x: u16,
     removed_floor: i16,
 ) -> bool {
-    let TravelMode::Stairs { x: route_x } = route else {
-        return false;
+    // The floors a lobby route climbs on stairs or an escalator, and where.
+    let (route_x, leg_start, leg_end) = match route {
+        TravelMode::Stairs { x } => (x, 1, destination_floor),
+        TravelMode::ElevatorThenWalkway {
+            walkway_x,
+            transfer_floor,
+            ..
+        } => (walkway_x, transfer_floor, destination_floor),
+        TravelMode::WalkwayThenElevator {
+            walkway_x,
+            transfer_floor,
+            ..
+        } => (walkway_x, 1, transfer_floor),
+        TravelMode::SameFloor
+        | TravelMode::Elevator { .. }
+        | TravelMode::ElevatorTransfer { .. } => {
+            return false;
+        }
     };
     let walkway_x = f32::from(removed_x) + f32::from(removed_kind.spec().width) * 0.5;
     if (route_x - walkway_x).abs() > f32::EPSILON {
@@ -2087,10 +2169,22 @@ fn route_uses_removed_walkway(
 
     // A flight based on N joins ordinal N to N + 1. First floor is ordinal
     // zero, while B1 is -1, so this also handles the B1/first-floor join.
-    let origin = floor_ordinal(1);
-    let destination = floor_ordinal(destination_floor);
+    let start = floor_ordinal(leg_start);
+    let end = floor_ordinal(leg_end);
     let flight_base = floor_ordinal(removed_floor);
-    origin.min(destination) <= flight_base && origin.max(destination) > flight_base
+    start.min(end) <= flight_base && start.max(end) > flight_base
+}
+
+/// Where the walk to the destination begins: the x of the last shaft, stairs or escalator the
+/// route uses, or `None` for a route that stays on one floor.
+fn final_transport_x(route: TravelMode) -> Option<f32> {
+    match route {
+        TravelMode::SameFloor => None,
+        TravelMode::Elevator { x, .. } | TravelMode::Stairs { x } => Some(x),
+        TravelMode::ElevatorTransfer { second_x, .. } => Some(second_x),
+        TravelMode::ElevatorThenWalkway { walkway_x, .. } => Some(walkway_x),
+        TravelMode::WalkwayThenElevator { shaft_x, .. } => Some(shaft_x),
+    }
 }
 
 fn route_uses_removed_floor(
@@ -2108,10 +2202,10 @@ fn route_uses_removed_floor(
         return false;
     }
 
-    let transport_x = match route {
-        TravelMode::SameFloor => return true,
-        TravelMode::Elevator { x, .. } | TravelMode::Stairs { x } => x,
-        TravelMode::ElevatorTransfer { second_x, .. } => second_x,
+    // Transfer walks cross only lobby and walkway cells, whose floor cannot be removed, so only
+    // the final walk can be cut.
+    let Some(transport_x) = final_transport_x(route) else {
+        return true;
     };
     let destination_x = endpoint(destination).x;
     let start = transport_x.min(destination_x).floor().max(0.0) as u16;
@@ -2267,6 +2361,41 @@ fn choose_route_scored(
         floors,
         ElevatorAccess::Public,
     )
+    .or_else(|| choose_walkway_transfer(origin, destination, elevators, facilities, floors))
+}
+
+/// The best route pairing one elevator ride with one stairs or escalator leg. Callers use it
+/// only when nothing simpler reaches the destination: the original prices any ride that needs
+/// a transfer far above a direct one (3000 against 640, plus height), so this serves floors
+/// nothing else reaches without rerouting anyone who already has a direct way in.
+fn choose_walkway_transfer(
+    origin: Endpoint,
+    destination: Endpoint,
+    elevators: &[ElevatorShaft],
+    facilities: &[Facility],
+    floors: &[GridPosition],
+) -> Option<(TravelMode, f32)> {
+    walkway_transfer_candidates(
+        origin,
+        destination,
+        elevators,
+        facilities,
+        floors,
+        &lobby_floors(facilities),
+    )
+    .into_iter()
+    .min_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+fn lobby_floors(facilities: &[Facility]) -> Vec<i16> {
+    let mut floors: Vec<i16> = facilities
+        .iter()
+        .filter(|facility| facility.kind == FacilityKind::Lobby)
+        .map(|facility| facility.position.floor)
+        .collect();
+    floors.sort_unstable();
+    floors.dedup();
+    floors
 }
 
 fn choose_route_scored_for(
@@ -2291,23 +2420,11 @@ fn choose_route_scored_for(
     // equally attractive.
     if access == ElevatorAccess::Public {
         for (kind, x) in connected_vertical_walkways(origin.floor, destination.floor, facilities) {
-            let limit = if kind == FacilityKind::Escalator {
-                MAX_ESCALATOR_FLIGHTS
-            } else {
-                MAX_STAIR_FLIGHTS
-            };
-            if flights <= limit
+            if let Some(climb) = walkway_climb_cost(kind, flights)
                 && horizontal_floor_path(origin.floor, origin.x, x, floors)
                 && horizontal_floor_path(destination.floor, x, destination.x, floors)
             {
-                let flight_penalty = if kind == FacilityKind::Escalator {
-                    3.0
-                } else {
-                    6.0
-                };
-                let score = (origin.x - x).abs()
-                    + (destination.x - x).abs()
-                    + (flights * flights) as f32 * flight_penalty;
+                let score = (origin.x - x).abs() + (destination.x - x).abs() + climb;
                 candidates.push((TravelMode::Stairs { x }, score));
             }
         }
@@ -2342,13 +2459,7 @@ fn choose_route_scored_for(
             .min_by(|left, right| left.1.total_cmp(&right.1));
     }
 
-    let mut lobby_floors: Vec<i16> = facilities
-        .iter()
-        .filter(|facility| facility.kind == FacilityKind::Lobby)
-        .map(|facility| facility.position.floor)
-        .collect();
-    lobby_floors.sort_unstable();
-    lobby_floors.dedup();
+    let lobby_floors = lobby_floors(facilities);
     for first in elevators.iter().filter(|shaft| {
         let x = shaft_center(shaft);
         elevator_accepts(shaft.kind, access)
@@ -2379,7 +2490,7 @@ fn choose_route_scored_for(
                 let score = (origin.x - first_x).abs()
                     + (first_x - second_x).abs()
                     + (destination.x - second_x).abs()
-                    + 30.0
+                    + TRANSFER_PENALTY
                     + (first_flights + second_flights) as f32 * 0.5
                     + second_flights as f32 * 0.01;
                 candidates.push((
@@ -2399,6 +2510,164 @@ fn choose_route_scored_for(
     candidates
         .into_iter()
         .min_by(|left, right| left.1.total_cmp(&right.1))
+}
+
+/// The perceived cost of climbing `flights` on one stairs or escalator column, or `None` past
+/// the longest climb people accept on it.
+fn walkway_climb_cost(kind: FacilityKind, flights: u16) -> Option<f32> {
+    let (limit, flight_penalty) = if kind == FacilityKind::Escalator {
+        (MAX_ESCALATOR_FLIGHTS, 3.0)
+    } else {
+        (MAX_STAIR_FLIGHTS, 6.0)
+    };
+    (flights <= limit).then(|| f32::from(flights * flights) * flight_penalty)
+}
+
+fn flights_between(from: i16, to: i16) -> u16 {
+    (floor_ordinal(to) - floor_ordinal(from)).unsigned_abs()
+}
+
+/// Routes that pair one elevator ride with one stairs or escalator leg, changing between them
+/// at a lobby that touches both. The original routes one leg at a time and treats a floor a
+/// short climb from a lobby as reachable through that lobby's elevators (tower-together
+/// `specs/ROUTING.md`, "Lobby Local Access Ranges"), so a floor beside a sky lobby is served
+/// by the express that stops there.
+fn walkway_transfer_candidates(
+    origin: Endpoint,
+    destination: Endpoint,
+    elevators: &[ElevatorShaft],
+    facilities: &[Facility],
+    floors: &[GridPosition],
+    lobby_floors: &[i16],
+) -> Vec<(TravelMode, f32)> {
+    let longest_climb = MAX_STAIR_FLIGHTS.max(MAX_ESCALATOR_FLIGHTS);
+    let public_shafts = || {
+        elevators
+            .iter()
+            .filter(|shaft| elevator_accepts(shaft.kind, ElevatorAccess::Public))
+    };
+    let mut candidates = Vec::new();
+    for &transfer_floor in lobby_floors {
+        if transfer_floor == origin.floor || transfer_floor == destination.floor {
+            continue;
+        }
+
+        let climb_flights = flights_between(transfer_floor, destination.floor);
+        let ride_flights = flights_between(origin.floor, transfer_floor);
+        let walkways = if climb_flights <= longest_climb {
+            connected_vertical_walkways(transfer_floor, destination.floor, facilities)
+        } else {
+            Vec::new()
+        };
+        for (kind, walkway_x) in walkways {
+            let Some(climb) = walkway_climb_cost(kind, climb_flights) else {
+                continue;
+            };
+            if !horizontal_floor_path(destination.floor, walkway_x, destination.x, floors) {
+                continue;
+            }
+            for shaft in public_shafts().filter(|shaft| {
+                let shaft_x = shaft_center(shaft);
+                shaft_stops_at(shaft, origin.floor, facilities)
+                    && shaft_stops_at(shaft, transfer_floor, facilities)
+                    && lobby_endpoint_connects_to_shaft(origin, shaft, facilities)
+                    && horizontal_floor_path(origin.floor, origin.x, shaft_x, floors)
+                    && lobby_connects_shaft_and_walkway(
+                        transfer_floor,
+                        shaft,
+                        kind,
+                        walkway_x,
+                        facilities,
+                    )
+                    && horizontal_floor_path(transfer_floor, shaft_x, walkway_x, floors)
+            }) {
+                let shaft_x = shaft_center(shaft);
+                let score = (origin.x - shaft_x).abs()
+                    + (shaft_x - walkway_x).abs()
+                    + (destination.x - walkway_x).abs()
+                    + TRANSFER_PENALTY
+                    + f32::from(ride_flights) * 0.5
+                    + climb;
+                candidates.push((
+                    TravelMode::ElevatorThenWalkway {
+                        shaft_id: shaft.id,
+                        shaft_x,
+                        transfer_floor,
+                        walkway_x,
+                    },
+                    score,
+                ));
+            }
+        }
+
+        let climb_flights = flights_between(origin.floor, transfer_floor);
+        let ride_flights = flights_between(transfer_floor, destination.floor);
+        let walkways = if climb_flights <= longest_climb {
+            connected_vertical_walkways(origin.floor, transfer_floor, facilities)
+        } else {
+            Vec::new()
+        };
+        for (kind, walkway_x) in walkways {
+            let Some(climb) = walkway_climb_cost(kind, climb_flights) else {
+                continue;
+            };
+            if !horizontal_floor_path(origin.floor, origin.x, walkway_x, floors) {
+                continue;
+            }
+            for shaft in public_shafts().filter(|shaft| {
+                let shaft_x = shaft_center(shaft);
+                shaft_stops_at(shaft, transfer_floor, facilities)
+                    && shaft_stops_at(shaft, destination.floor, facilities)
+                    && lobby_endpoint_connects_to_shaft(destination, shaft, facilities)
+                    && horizontal_floor_path(destination.floor, shaft_x, destination.x, floors)
+                    && lobby_connects_shaft_and_walkway(
+                        transfer_floor,
+                        shaft,
+                        kind,
+                        walkway_x,
+                        facilities,
+                    )
+                    && horizontal_floor_path(transfer_floor, walkway_x, shaft_x, floors)
+            }) {
+                let shaft_x = shaft_center(shaft);
+                let score = (origin.x - walkway_x).abs()
+                    + (walkway_x - shaft_x).abs()
+                    + (destination.x - shaft_x).abs()
+                    + TRANSFER_PENALTY
+                    + f32::from(ride_flights) * 0.5
+                    + climb;
+                candidates.push((
+                    TravelMode::WalkwayThenElevator {
+                        walkway_x,
+                        transfer_floor,
+                        shaft_id: shaft.id,
+                        shaft_x,
+                    },
+                    score,
+                ));
+            }
+        }
+    }
+    candidates
+}
+
+/// Whether one lobby on `floor` touches both the shaft and the stairs or escalator column
+/// centred on `walkway_x`, so people can change between them without leaving the lobby.
+fn lobby_connects_shaft_and_walkway(
+    floor: i16,
+    shaft: &ElevatorShaft,
+    walkway_kind: FacilityKind,
+    walkway_x: f32,
+    facilities: &[Facility],
+) -> bool {
+    let half_width = f32::from(walkway_kind.spec().width) * 0.5;
+    lobby_components(floor, facilities)
+        .into_iter()
+        .any(|component| {
+            component_touches_shaft(component, shaft)
+                && f32::from(component.0) <= walkway_x + half_width
+                && f32::from(component.1) >= walkway_x - half_width
+        })
 }
 
 fn elevator_accepts(kind: FacilityKind, access: ElevatorAccess) -> bool {
@@ -2695,10 +2964,42 @@ fn trip_destination(person: &Person) -> Endpoint {
 
 fn desired_elevator_floor(person: &Person) -> i16 {
     match person.route {
-        TravelMode::ElevatorTransfer { transfer_floor, .. } if person.route_leg == 0 => {
+        TravelMode::ElevatorTransfer { transfer_floor, .. }
+        | TravelMode::ElevatorThenWalkway { transfer_floor, .. }
+            if person.route_leg == 0 =>
+        {
             transfer_floor
         }
         _ => trip_destination(person).floor,
+    }
+}
+
+/// The floor a stairs or escalator leg ends on: the transfer lobby when the walkway comes
+/// first, otherwise the destination floor.
+fn walkway_leg_end_floor(person: &Person) -> i16 {
+    match person.route {
+        TravelMode::WalkwayThenElevator { transfer_floor, .. } if person.route_leg == 0 => {
+            transfer_floor
+        }
+        _ => trip_destination(person).floor,
+    }
+}
+
+/// Ends the leg a person has just ridden or climbed. A two-leg route walks on to its second
+/// transport; otherwise the person walks to the destination.
+fn finish_leg(person: &mut Person) {
+    let second_leg_follows = person.route_leg == 0
+        && matches!(
+            person.route,
+            TravelMode::ElevatorTransfer { .. }
+                | TravelMode::ElevatorThenWalkway { .. }
+                | TravelMode::WalkwayThenElevator { .. }
+        );
+    if second_leg_follows {
+        person.route_leg = 1;
+        person.walking_from_transport = false;
+    } else {
+        person.walking_from_transport = true;
     }
 }
 
@@ -2716,6 +3017,28 @@ fn reverse_route(route: TravelMode) -> TravelMode {
             transfer_floor,
             second_id: first_id,
             second_x: first_x,
+        },
+        TravelMode::ElevatorThenWalkway {
+            shaft_id,
+            shaft_x,
+            transfer_floor,
+            walkway_x,
+        } => TravelMode::WalkwayThenElevator {
+            walkway_x,
+            transfer_floor,
+            shaft_id,
+            shaft_x,
+        },
+        TravelMode::WalkwayThenElevator {
+            walkway_x,
+            transfer_floor,
+            shaft_id,
+            shaft_x,
+        } => TravelMode::ElevatorThenWalkway {
+            shaft_id,
+            shaft_x,
+            transfer_floor,
+            walkway_x,
         },
         other => other,
     }
@@ -3640,6 +3963,167 @@ mod tests {
             &[],
         );
         assert!(route.is_none());
+    }
+
+    /// Floors 1-15 with lobbies on 1 and 15, an express from 1 to 15, and an office on 14
+    /// whose only way in is the express to the sky lobby and a staircase down from it.
+    fn office_below_a_sky_lobby(stairs_x: u16) -> (Tower, u64, u64) {
+        let mut tower = Tower::new(64, 1_000_000_000);
+        place_floor_run(&mut tower, 15, 64);
+        for floor in [1, 15] {
+            for x in 0..20 {
+                tower
+                    .place(FacilityKind::Lobby, GridPosition { x, floor })
+                    .unwrap();
+            }
+        }
+        for floor in 1..=15 {
+            tower
+                .place(FacilityKind::ExpressElevator, GridPosition { x: 20, floor })
+                .unwrap();
+        }
+        let stairs = tower
+            .place(
+                FacilityKind::Stairs,
+                GridPosition {
+                    x: stairs_x,
+                    floor: 14,
+                },
+            )
+            .unwrap();
+        let office = tower
+            .place(FacilityKind::Office, GridPosition { x: 40, floor: 14 })
+            .unwrap();
+        tower.advance_time(60.0);
+        (tower, office, stairs)
+    }
+
+    #[test]
+    fn a_floor_beside_a_sky_lobby_is_reached_by_its_express_and_the_stairs() {
+        let (tower, office, _) = office_below_a_sky_lobby(4);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+
+        let route = *traffic.routes_from_lobby.get(&office).unwrap();
+        let TravelMode::ElevatorThenWalkway {
+            shaft_id,
+            transfer_floor,
+            ..
+        } = route
+        else {
+            panic!("expected an express ride and a stair climb, got {route:?}");
+        };
+        assert_eq!(shaft_id, traffic.elevators[0].id);
+        assert_eq!(transfer_floor, 15);
+        assert_eq!(reverse_route(reverse_route(route)), route);
+    }
+
+    #[test]
+    fn a_direct_elevator_keeps_priority_over_a_sky_lobby_stair_route() {
+        let mut tower = Tower::new(128, 1_000_000_000);
+        place_floor_run(&mut tower, 15, 128);
+        for (floor, columns) in [(1, 0..20), (1, 104..112), (15, 0..20)] {
+            for x in columns {
+                tower
+                    .place(FacilityKind::Lobby, GridPosition { x, floor })
+                    .unwrap();
+            }
+        }
+        for floor in 1..=15 {
+            tower
+                .place(FacilityKind::ExpressElevator, GridPosition { x: 20, floor })
+                .unwrap();
+        }
+        // A local far across the tower, whose ride costs more walking than the express and
+        // the stairs beside the office.
+        for floor in 1..=14 {
+            tower
+                .place(FacilityKind::Elevator, GridPosition { x: 100, floor })
+                .unwrap();
+        }
+        tower
+            .place(FacilityKind::Stairs, GridPosition { x: 4, floor: 14 })
+            .unwrap();
+        let office = tower
+            .place(FacilityKind::Office, GridPosition { x: 10, floor: 14 })
+            .unwrap();
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+
+        let local = traffic
+            .elevators
+            .iter()
+            .find(|shaft| shaft.kind == FacilityKind::Elevator)
+            .unwrap()
+            .id;
+        assert!(matches!(
+            traffic.routes_from_lobby.get(&office),
+            Some(TravelMode::Elevator { shaft_id, .. }) if *shaft_id == local
+        ));
+    }
+
+    #[test]
+    fn a_stair_the_sky_lobby_does_not_reach_is_no_transfer() {
+        let (tower, office, _) = office_below_a_sky_lobby(40);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        assert!(!traffic.routes_from_lobby.contains_key(&office));
+    }
+
+    #[test]
+    fn people_ride_to_the_sky_lobby_then_climb_down_and_back() {
+        let (tower, office, _) = office_below_a_sky_lobby(4);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        for _ in 0..800 {
+            traffic.advance(&tower, 0.25);
+        }
+        assert!(traffic.visitors_at(office) > 0);
+
+        // Send one worker home and follow them out of the tower.
+        let worker = traffic
+            .people
+            .iter_mut()
+            .find(|person| {
+                person.destination_facility_id == office
+                    && person.activity == PersonActivity::Visiting
+            })
+            .unwrap();
+        let worker_id = worker.id;
+        worker.visit_remaining = 0.1;
+        let shaft_id = traffic.elevators[0].id;
+        let mut climbed_up = false;
+        let mut waited_at_sky_lobby = false;
+        let mut rode_down = false;
+        let mut gave_up = false;
+        for _ in 0..2_000 {
+            traffic.advance(&tower, 0.25);
+            let Some(worker) = traffic.people.iter().find(|person| person.id == worker_id) else {
+                break;
+            };
+            climbed_up |= worker.activity == PersonActivity::UsingStairs;
+            waited_at_sky_lobby |= worker.activity
+                == PersonActivity::WaitingForElevator { shaft_id }
+                && worker.current_floor == 15;
+            rode_down |= worker.activity == PersonActivity::RidingElevator { shaft_id };
+            gave_up |= worker.activity == PersonActivity::LeavingElevatorQueue;
+        }
+        assert!(climbed_up && waited_at_sky_lobby && rode_down);
+        assert!(!gave_up);
+        assert!(traffic.people.iter().all(|person| person.id != worker_id));
+    }
+
+    #[test]
+    fn demolishing_the_stairs_cuts_the_sky_lobby_route() {
+        let (mut tower, office, stairs) = office_below_a_sky_lobby(4);
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        assert!(traffic.routes_from_lobby.contains_key(&office));
+
+        let removed = tower.demolish(stairs).unwrap();
+        traffic.sync_with_tower_after_removal(&tower, &removed);
+
+        assert!(!traffic.routes_from_lobby.contains_key(&office));
     }
 
     #[test]
