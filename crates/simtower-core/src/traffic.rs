@@ -2268,8 +2268,27 @@ fn assign_waiting_calls(
                         .total_cmp(&(right.1.floor_position - floor_position).abs())
                 })
                 .map(|(index, _)| index);
-            committed
-                .or(moving)
+            // The original takes a car standing at the caller's floor at once, and
+            // otherwise prefers the nearest idle car unless a moving one is closer by less than
+            // the dispatch threshold (tower-together specs/ELEVATORS.md, "Floor Assignment").
+            // A car heading back to its home floor targets that floor too, so being committed
+            // alone must not outrank an idle car much nearer the caller.
+            let distance = |index: usize| (shaft.cars[index].floor_position - floor_position).abs();
+            let at_floor = shaft.cars.iter().position(|car| {
+                has_room(car)
+                    && (car.floor_position - floor_position).abs() < 0.01
+                    && car.target_floor.is_none_or(|target| target == floor)
+                    && (car.direction == ElevatorDirection::Idle
+                        || car.direction == desired_direction)
+            });
+            let idle_distance = waiting.map(distance);
+            let within_threshold_of_idle = |index: &usize| {
+                idle_distance
+                    .is_none_or(|idle| distance(*index) - idle < f32::from(response_floors))
+            };
+            at_floor
+                .or(committed.filter(within_threshold_of_idle))
+                .or(moving.filter(within_threshold_of_idle))
                 .or(waiting)
                 .or(nearest)
                 .map(|index| (floor, index))
@@ -5199,6 +5218,94 @@ mod tests {
             traffic.people[0].activity,
             PersonActivity::WaitingForElevator { shaft_id: waiting } if waiting == shaft_id
         ));
+    }
+
+    /// A shaft over floors 1-30 with one waiter on `floor` bound upward, and cars at the given
+    /// (ordinal position, target, direction).
+    fn hall_call(floor: i16, cars: &[(f32, Option<i16>, ElevatorDirection)]) -> Vec<(i16, usize)> {
+        let mut shaft = test_shaft(1, FacilityKind::Elevator, 8, &(1..=30).collect::<Vec<_>>());
+        shaft.cars = cars
+            .iter()
+            .map(|&(floor_position, target_floor, direction)| ElevatorCar {
+                floor_position,
+                home_floor: 1,
+                direction,
+                target_floor,
+                passengers: Vec::new(),
+                dwell_remaining: 0.0,
+            })
+            .collect();
+        let waiter = Person {
+            id: 7,
+            role: PersonRole::Visitor,
+            home_facility_id: 0,
+            destination_facility_id: 0,
+            x: 10.0,
+            floor_position: f32::from(floor_ordinal(floor)),
+            current_floor: floor,
+            mood: PersonMood::Calm,
+            activity: PersonActivity::WaitingForElevator { shaft_id: 1 },
+            wait_seconds: 0.0,
+            origin: Endpoint {
+                facility_id: 0,
+                x: 0.0,
+                floor,
+            },
+            destination: Endpoint {
+                facility_id: 0,
+                x: 10.0,
+                floor: 25,
+            },
+            route: TravelMode::Elevator {
+                shaft_id: 1,
+                x: 10.0,
+            },
+            going_home: false,
+            walking_from_transport: false,
+            visit_remaining: 0.0,
+            visit_duration: 1.0,
+            stair_progress: 0.0,
+            route_leg: 0,
+        };
+        assign_waiting_calls(&shaft, &[waiter], 5)
+    }
+
+    #[test]
+    fn an_idle_car_at_the_callers_floor_takes_the_call_from_a_car_heading_home() {
+        // Car 1 is returning to its home floor, the lobby, from floor 25.
+        let assignments = hall_call(
+            1,
+            &[
+                (0.0, None, ElevatorDirection::Idle),
+                (24.0, Some(1), ElevatorDirection::Down),
+            ],
+        );
+        assert_eq!(assignments, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn a_far_car_heading_to_the_callers_floor_yields_to_a_near_idle_car() {
+        let assignments = hall_call(
+            10,
+            &[
+                (8.0, None, ElevatorDirection::Idle),
+                (28.0, Some(10), ElevatorDirection::Down),
+            ],
+        );
+        assert_eq!(assignments, vec![(10, 0)]);
+    }
+
+    #[test]
+    fn a_car_heading_to_the_callers_floor_keeps_it_within_the_dispatch_threshold() {
+        // Car 1 is three floors away against the idle car's one: within the threshold of 5.
+        let assignments = hall_call(
+            10,
+            &[
+                (8.0, None, ElevatorDirection::Idle),
+                (12.0, Some(10), ElevatorDirection::Down),
+            ],
+        );
+        assert_eq!(assignments, vec![(10, 1)]);
     }
 
     #[test]
