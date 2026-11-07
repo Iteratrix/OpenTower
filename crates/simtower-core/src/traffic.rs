@@ -5206,7 +5206,6 @@ mod tests {
             advance_shaft(
                 &mut traffic.elevators[0],
                 &mut traffic.people,
-                tower.facilities(),
                 tower.clock,
                 0.25,
             );
