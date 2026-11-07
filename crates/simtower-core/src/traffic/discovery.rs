@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use super::*;
 use crate::{DEFAULT_TOWER_WIDTH, Facility, SimulationSpeed, Tower};
 
+mod fuzz;
 mod props;
 
 pub(super) const FRAME_SECONDS: f32 = 1.0 / 60.0;
