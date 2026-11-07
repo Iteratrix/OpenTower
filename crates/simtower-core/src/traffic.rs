@@ -3546,6 +3546,9 @@ fn next_spawn_interval(star_rating: u8, seed: u64) -> f32 {
 }
 
 #[cfg(test)]
+mod discovery;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{FacilityOccupancy, GridPosition};
