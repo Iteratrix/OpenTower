@@ -43,7 +43,7 @@ const MODES: [ElevatorMode; 3] = [
     ElevatorMode::ExpressToTop,
     ElevatorMode::ExpressToBottom,
 ];
-const KNOWN: [&str; 2] = ["idle car beside a waiter", "shaft has a gap"];
+const KNOWN: [&str; 1] = ["shaft has a gap"];
 
 /// Edits aim at existing structure (an anchor picked by index from the current state) so most
 /// of them are legal and land where traffic already flows; a few absolute placements keep

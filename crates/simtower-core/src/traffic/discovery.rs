@@ -752,7 +752,7 @@ fn finding_express_schedule_traps_riders_bound_elsewhere() {
         }];
         let clock = crate::Clock::default();
         for _ in 0..600 {
-            advance_shaft(&mut shaft, &mut people, &[], clock, 0.1);
+            advance_shaft(&mut shaft, &mut people, clock, 0.1);
         }
         assert_eq!(
             people[0].activity,
