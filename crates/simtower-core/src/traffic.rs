@@ -1095,13 +1095,7 @@ impl TrafficSimulation {
                 .map(|person| person.destination_facility_id),
         );
         for shaft in &mut self.elevators {
-            advance_shaft(
-                shaft,
-                &mut self.people,
-                tower.facilities(),
-                tower.clock,
-                elapsed_seconds,
-            );
+            advance_shaft(shaft, &mut self.people, tower.clock, elapsed_seconds);
         }
         self.people.retain(|person| {
             !(person.visit_remaining <= 0.0
@@ -2010,15 +2004,11 @@ fn step_off_and_abandon(person: &mut Person, floor: i16, x: f32) {
 fn advance_shaft(
     shaft: &mut ElevatorShaft,
     people: &mut [Person],
-    facilities: &[Facility],
     clock: Clock,
     elapsed_seconds: f32,
 ) {
     let schedule = shaft.current_schedule(clock);
     let waiting_assignments = assign_waiting_calls(shaft, people, schedule.waiting_car_response);
-    let landing_floors = landing_floors(shaft.kind, shaft.x, &shaft.served_floors, facilities);
-    let top_floor = landing_floors.last().copied();
-    let bottom_floor = landing_floors.first().copied();
     for (car_index, car) in shaft.cars.iter_mut().enumerate() {
         if car.dwell_remaining > 0.0 {
             car.dwell_remaining -= elapsed_seconds;
@@ -2037,9 +2027,18 @@ fn advance_shaft(
             }
             car.target_floor = Some(car.home_floor);
         } else if !car.passengers.is_empty() && schedule.mode == ElevatorMode::ExpressToTop {
-            car.target_floor = top_floor;
+            // Like the original's express-up schedule, run without stopping to the highest
+            // requested floor, then the next. Always heading for the top served floor never let
+            // off anyone bound elsewhere.
+            car.target_floor = stops
+                .iter()
+                .copied()
+                .max_by_key(|floor| floor_ordinal(*floor));
         } else if !car.passengers.is_empty() && schedule.mode == ElevatorMode::ExpressToBottom {
-            car.target_floor = bottom_floor;
+            car.target_floor = stops
+                .iter()
+                .copied()
+                .min_by_key(|floor| floor_ordinal(*floor));
         } else {
             car.target_floor = choose_next_stop(car.floor_position, car.direction, &stops);
         }
@@ -2268,8 +2267,27 @@ fn assign_waiting_calls(
                         .total_cmp(&(right.1.floor_position - floor_position).abs())
                 })
                 .map(|(index, _)| index);
-            committed
-                .or(moving)
+            // The original takes a car standing at the caller's floor at once, and
+            // otherwise prefers the nearest idle car unless a moving one is closer by less than
+            // the dispatch threshold (tower-together specs/ELEVATORS.md, "Floor Assignment").
+            // A car heading back to its home floor targets that floor too, so being committed
+            // alone must not outrank an idle car much nearer the caller.
+            let distance = |index: usize| (shaft.cars[index].floor_position - floor_position).abs();
+            let at_floor = shaft.cars.iter().position(|car| {
+                has_room(car)
+                    && (car.floor_position - floor_position).abs() < 0.01
+                    && car.target_floor.is_none_or(|target| target == floor)
+                    && (car.direction == ElevatorDirection::Idle
+                        || car.direction == desired_direction)
+            });
+            let idle_distance = waiting.map(distance);
+            let within_threshold_of_idle = |index: &usize| {
+                idle_distance
+                    .is_none_or(|idle| distance(*index) - idle < f32::from(response_floors))
+            };
+            at_floor
+                .or(committed.filter(within_threshold_of_idle))
+                .or(moving.filter(within_threshold_of_idle))
                 .or(waiting)
                 .or(nearest)
                 .map(|index| (floor, index))
@@ -5191,7 +5209,6 @@ mod tests {
             advance_shaft(
                 &mut traffic.elevators[0],
                 &mut traffic.people,
-                tower.facilities(),
                 tower.clock,
                 0.25,
             );
@@ -5202,6 +5219,94 @@ mod tests {
             traffic.people[0].activity,
             PersonActivity::WaitingForElevator { shaft_id: waiting } if waiting == shaft_id
         ));
+    }
+
+    /// A shaft over floors 1-30 with one waiter on `floor` bound upward, and cars at the given
+    /// (ordinal position, target, direction).
+    fn hall_call(floor: i16, cars: &[(f32, Option<i16>, ElevatorDirection)]) -> Vec<(i16, usize)> {
+        let mut shaft = test_shaft(1, FacilityKind::Elevator, 8, &(1..=30).collect::<Vec<_>>());
+        shaft.cars = cars
+            .iter()
+            .map(|&(floor_position, target_floor, direction)| ElevatorCar {
+                floor_position,
+                home_floor: 1,
+                direction,
+                target_floor,
+                passengers: Vec::new(),
+                dwell_remaining: 0.0,
+            })
+            .collect();
+        let waiter = Person {
+            id: 7,
+            role: PersonRole::Visitor,
+            home_facility_id: 0,
+            destination_facility_id: 0,
+            x: 10.0,
+            floor_position: f32::from(floor_ordinal(floor)),
+            current_floor: floor,
+            mood: PersonMood::Calm,
+            activity: PersonActivity::WaitingForElevator { shaft_id: 1 },
+            wait_seconds: 0.0,
+            origin: Endpoint {
+                facility_id: 0,
+                x: 0.0,
+                floor,
+            },
+            destination: Endpoint {
+                facility_id: 0,
+                x: 10.0,
+                floor: 25,
+            },
+            route: TravelMode::Elevator {
+                shaft_id: 1,
+                x: 10.0,
+            },
+            going_home: false,
+            walking_from_transport: false,
+            visit_remaining: 0.0,
+            visit_duration: 1.0,
+            stair_progress: 0.0,
+            route_leg: 0,
+        };
+        assign_waiting_calls(&shaft, &[waiter], 5)
+    }
+
+    #[test]
+    fn an_idle_car_at_the_callers_floor_takes_the_call_from_a_car_heading_home() {
+        // Car 1 is returning to its home floor, the lobby, from floor 25.
+        let assignments = hall_call(
+            1,
+            &[
+                (0.0, None, ElevatorDirection::Idle),
+                (24.0, Some(1), ElevatorDirection::Down),
+            ],
+        );
+        assert_eq!(assignments, vec![(1, 0)]);
+    }
+
+    #[test]
+    fn a_far_car_heading_to_the_callers_floor_yields_to_a_near_idle_car() {
+        let assignments = hall_call(
+            10,
+            &[
+                (8.0, None, ElevatorDirection::Idle),
+                (28.0, Some(10), ElevatorDirection::Down),
+            ],
+        );
+        assert_eq!(assignments, vec![(10, 0)]);
+    }
+
+    #[test]
+    fn a_car_heading_to_the_callers_floor_keeps_it_within_the_dispatch_threshold() {
+        // Car 1 is three floors away against the idle car's one: within the threshold of 5.
+        let assignments = hall_call(
+            10,
+            &[
+                (8.0, None, ElevatorDirection::Idle),
+                (12.0, Some(10), ElevatorDirection::Down),
+            ],
+        );
+        assert_eq!(assignments, vec![(10, 1)]);
     }
 
     #[test]
@@ -5222,6 +5327,74 @@ mod tests {
         assert_eq!(traffic.elevators[0].cars.len(), MAX_ELEVATOR_CARS);
         assert!(!traffic.add_elevator_car(&tower, shaft_id, 8));
         assert_eq!(traffic.elevators[0].cars.len(), MAX_ELEVATOR_CARS);
+    }
+
+    #[test]
+    fn express_schedules_deliver_every_rider_farthest_floor_first() {
+        for (mode, start, wanted, first) in [
+            (ElevatorMode::ExpressToTop, 1, [4, 8], 8),
+            (ElevatorMode::ExpressToBottom, 10, [6, 2], 2),
+        ] {
+            let mut shaft = test_shaft(1, FacilityKind::Elevator, 8, &(1..=10).collect::<Vec<_>>());
+            shaft.schedules = [ElevatorSchedule {
+                mode,
+                ..ElevatorSchedule::default()
+            }; 12];
+            shaft.cars.push(ElevatorCar {
+                floor_position: f32::from(floor_ordinal(start)),
+                home_floor: 1,
+                direction: ElevatorDirection::Idle,
+                target_floor: None,
+                passengers: vec![1, 2],
+                dwell_remaining: 0.0,
+            });
+            let rider = |id: u64, floor: i16| Person {
+                id,
+                role: PersonRole::Visitor,
+                home_facility_id: 0,
+                destination_facility_id: 0,
+                x: 10.0,
+                floor_position: f32::from(floor_ordinal(start)),
+                current_floor: start,
+                mood: PersonMood::Calm,
+                activity: PersonActivity::RidingElevator { shaft_id: 1 },
+                wait_seconds: 0.0,
+                origin: Endpoint {
+                    facility_id: 0,
+                    x: 0.0,
+                    floor: start,
+                },
+                destination: Endpoint {
+                    facility_id: 0,
+                    x: 10.0,
+                    floor,
+                },
+                route: TravelMode::Elevator {
+                    shaft_id: 1,
+                    x: 10.0,
+                },
+                going_home: false,
+                walking_from_transport: false,
+                visit_remaining: 0.0,
+                visit_duration: 1.0,
+                stair_progress: 0.0,
+                route_leg: 0,
+            };
+            let mut people = vec![rider(1, wanted[0]), rider(2, wanted[1])];
+            let mut arrivals = Vec::new();
+            for _ in 0..600 {
+                advance_shaft(&mut shaft, &mut people, Clock::default(), 0.1);
+                for person in &people {
+                    if person.activity == PersonActivity::Walking
+                        && !arrivals.contains(&person.current_floor)
+                    {
+                        arrivals.push(person.current_floor);
+                    }
+                }
+            }
+            assert_eq!(arrivals.len(), 2, "{mode:?}: arrivals {arrivals:?}");
+            assert_eq!(arrivals[0], first, "{mode:?}: arrivals {arrivals:?}");
+        }
     }
 
     #[test]
