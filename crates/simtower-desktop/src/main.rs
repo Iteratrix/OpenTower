@@ -2310,7 +2310,7 @@ impl App {
         save.tower
             .expand_site_width(simtower_core::DEFAULT_TOWER_WIDTH);
         let options = save.resolved_options();
-        save.traffic.sync_with_tower(&save.tower);
+        save.traffic.sync_with_loaded_tower(&save.tower);
         self.tower = save.tower;
         self.traffic = save.traffic;
         self.camera_x = save

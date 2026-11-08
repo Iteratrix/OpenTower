@@ -711,6 +711,16 @@ impl TrafficSimulation {
         self.sync_with_tower_internal(tower, TopologySync::Full);
     }
 
+    /// Synchronizes a freshly loaded save. A save carries shafts and lobby
+    /// routes that the build which wrote it derived from the tower, and a
+    /// matching topology signature would keep them as they are. Rebuild them
+    /// in full instead, so this build's routing applies from the moment the
+    /// save loads rather than after the next construction.
+    pub fn sync_with_loaded_tower(&mut self, tower: &Tower) {
+        self.topology_signature = !tower_topology_signature(tower);
+        self.sync_with_tower_internal(tower, TopologySync::Full);
+    }
+
     /// Synchronizes after construction that only adds route infrastructure.
     /// Existing routes remain valid, so only newly placed or previously
     /// unreachable destinations need pathfinding. Destructive edits continue
@@ -3790,6 +3800,47 @@ mod tests {
             route,
             Some(TravelMode::Elevator { shaft_id: 9, .. })
         ));
+    }
+
+    #[test]
+    fn loading_rebuilds_routes_and_shafts_cached_by_an_older_build() {
+        let mut tower = Tower::new(64, 10_000_000);
+        place_floor_run(&mut tower, 3, 64);
+        for x in 24..=32 {
+            tower
+                .place(FacilityKind::Lobby, GridPosition { x, floor: 1 })
+                .unwrap();
+        }
+        for floor in 1..=3 {
+            tower
+                .place(FacilityKind::Elevator, GridPosition { x: 32, floor })
+                .unwrap();
+        }
+        let office_id = tower
+            .place(FacilityKind::Office, GridPosition { x: 40, floor: 3 })
+            .unwrap();
+        let mut current = TrafficSimulation::new();
+        current.sync_with_tower(&tower);
+        assert!(current.reachable_facility_set().contains(&office_id));
+
+        // What an older build might have saved for the same tower: no route to the office and a
+        // shaft record that missed a floor.
+        let mut saved = current.clone();
+        saved.routes_from_lobby.remove(&office_id);
+        saved.reachable_facilities.remove(&office_id);
+        saved.elevators[0].served_floors.retain(|floor| *floor != 3);
+
+        let mut synced = saved.clone();
+        synced.sync_with_tower(&tower);
+        assert!(!synced.reachable_facility_set().contains(&office_id));
+
+        saved.sync_with_loaded_tower(&tower);
+        assert_eq!(saved.routes_from_lobby, current.routes_from_lobby);
+        assert_eq!(
+            saved.reachable_facility_set(),
+            current.reachable_facility_set()
+        );
+        assert_eq!(saved.elevators, current.elevators);
     }
 
     #[test]
