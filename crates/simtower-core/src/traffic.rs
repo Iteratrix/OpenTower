@@ -1059,6 +1059,7 @@ impl TrafficSimulation {
             self.daily_visits.clear();
             self.advance_commercial_patronage(tower);
         }
+        self.bring_residents_back(elapsed_seconds);
         self.dispatch_scheduled_trips(tower);
         self.spawn_accumulator += elapsed_seconds;
         let population_limit = (usize::from(tower.star_rating()) * 32).min(MAX_SIMULATED_PEOPLE);
@@ -1112,7 +1113,6 @@ impl TrafficSimulation {
                 && (person.activity == PersonActivity::LeavingElevatorQueue
                     || (person.going_home && person.activity == PersonActivity::Visiting)))
         });
-        self.bring_residents_back(elapsed_seconds);
         self.send_residents_away();
         self.refresh_current_visitors();
     }
@@ -1129,7 +1129,9 @@ impl TrafficSimulation {
 
     /// Counts down the trips of residents who are away and lets those whose trip has ended back
     /// in at the street, longest-gone first, while the tower has room. Their visit is over, so
-    /// they head home on the next tick like anyone else.
+    /// they head home on the next tick like anyone else. It runs first in a tick, before
+    /// scheduled trips and new visitors, so a slot freed since the last tick (someone leaving,
+    /// a resident going out, a demolition) goes to a resident due back ahead of anyone new.
     fn bring_residents_back(&mut self, elapsed_seconds: f32) {
         for person in &mut self.away {
             person.visit_remaining -= elapsed_seconds;
@@ -5616,6 +5618,44 @@ mod tests {
         let resident = traffic.people.iter().find(|person| person.id == 1).unwrap();
         assert!(resident.is_returning_home());
         assert_eq!(resident.activity, PersonActivity::Walking);
+    }
+
+    #[test]
+    fn a_resident_due_back_takes_a_freed_slot_before_a_new_visitor() {
+        let mut tower = traffic_tower(true);
+        // Six stars, so new visitors may fill the whole cap.
+        tower.tower_status_awarded = true;
+        let mut traffic = TrafficSimulation::new();
+        traffic.sync_with_tower(&tower);
+        let (office, route) = office_and_lobby_route(&tower, &traffic);
+        traffic.away.push(resident_out(1, &office, route, 0.1));
+        // Another resident reaches the street on an outside trip and frees the last slot.
+        traffic
+            .people
+            .push(resident_out(2, &office, route, 10_000.0));
+        for id in 3..=MAX_SIMULATED_PEOPLE as u64 {
+            let mut visitor = resident_out(id, &office, route, 10_000.0);
+            visitor.home_facility_id = 0;
+            visitor.destination_facility_id = office.id;
+            traffic.people.push(visitor);
+        }
+        traffic.next_person_id = MAX_SIMULATED_PEOPLE as u64 + 1;
+        // A new visitor is ready to arrive on every tick.
+        traffic.spawn_accumulator = 1_000.0;
+
+        for _ in 0..4 {
+            traffic.advance(&tower, 0.25);
+        }
+        assert!(
+            traffic.people.iter().any(|person| person.id == 1),
+            "the resident is still outside; newcomers {:?}",
+            traffic
+                .people
+                .iter()
+                .filter(|person| person.id > MAX_SIMULATED_PEOPLE as u64)
+                .map(|person| (person.id, person.destination_facility_id))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
