@@ -14,8 +14,8 @@ use proptest::test_runner::TestCaseError;
 
 use super::{FRAME_SECONDS, Monitor, frame, load_save};
 use crate::traffic::{
-    ElevatorMode, Endpoint, MAX_SIMULATED_PEOPLE, Person, PersonActivity, PersonMood, PersonRole,
-    TrafficSimulation, TravelMode, endpoint, floor_ordinal, shaft_center, shaft_stops_at,
+    ElevatorMode, Endpoint, Person, PersonActivity, PersonMood, PersonRole, TrafficSimulation,
+    TravelMode, endpoint, floor_ordinal, shaft_center, shaft_stops_at,
 };
 use crate::{FacilityKind, GridPosition, SimulationSpeed, Tower};
 
@@ -663,9 +663,14 @@ impl Run {
                         let start = landings[floor % landings.len()];
                         let target = &tenants[tenant % tenants.len()];
                         let shaft_x = shaft_center(&shaft);
-                        if target.position.floor != start {
+                        // Arrivals queue behind residents due back from an outside trip.
+                        let residents_due = traffic
+                            .away
+                            .iter()
+                            .any(|person| person.visit_remaining <= 0.0);
+                        if target.position.floor != start && !residents_due {
                             for _ in 0..count {
-                                if traffic.people.len() >= MAX_SIMULATED_PEOPLE {
+                                if traffic.people.len() >= super::people_cap() {
                                     break;
                                 }
                                 let id = traffic.next_person_id;
@@ -801,6 +806,17 @@ proptest! {
 
     #[test]
     fn random_histories_keep_the_invariants(ops in history()) {
+        let mut run = Run::new();
+        for (step, op) in ops.iter().enumerate() {
+            run.apply(step, op)?;
+        }
+    }
+
+    /// The same histories under a people cap of a few dozen, so a small tower lives at the cap
+    /// and slot leaks or starvation show up within a test.
+    #[test]
+    fn random_histories_under_a_small_cap_keep_the_invariants(cap in 4usize..=24, ops in history()) {
+        let _cap = super::PeopleCap::set(cap);
         let mut run = Run::new();
         for (step, op) in ops.iter().enumerate() {
             run.apply(step, op)?;

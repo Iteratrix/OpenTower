@@ -7,6 +7,18 @@ pub const ELEVATOR_CAPACITY: usize = 17;
 pub const EXPRESS_ELEVATOR_CAPACITY: usize = 34;
 pub const MAX_ELEVATOR_CARS: usize = 8;
 pub const MAX_SIMULATED_PEOPLE: usize = 160;
+
+/// The people cap in effect: `MAX_SIMULATED_PEOPLE`, or a lower one a discovery test sets so a
+/// small tower reaches the cap's edge cases.
+#[cfg(not(test))]
+const fn people_cap() -> usize {
+    MAX_SIMULATED_PEOPLE
+}
+
+#[cfg(test)]
+fn people_cap() -> usize {
+    discovery::people_cap()
+}
 pub const MAX_ELEVATOR_QUEUE_PER_FLOOR: usize = 12;
 pub const CONCERNED_WAIT_SECONDS: f32 = 10.0;
 pub const ANGRY_WAIT_SECONDS: f32 = 20.0;
@@ -337,7 +349,7 @@ impl TrafficSimulation {
     }
 
     pub fn validate_save_state(&self, tower: &Tower) -> Result<(), String> {
-        if self.people.len() > MAX_SIMULATED_PEOPLE
+        if self.people.len() > people_cap()
             || !self.spawn_accumulator.is_finite()
             || self.spawn_accumulator < 0.0
             || !self.next_spawn_seconds.is_finite()
@@ -555,7 +567,7 @@ impl TrafficSimulation {
         facility_id: u64,
         visit_seconds: f32,
     ) -> Option<u64> {
-        if self.people.len() >= MAX_SIMULATED_PEOPLE {
+        if self.people.len() >= people_cap() {
             return None;
         }
         let facility = tower
@@ -656,7 +668,7 @@ impl TrafficSimulation {
         room_id: u64,
         cleaning_seconds: f32,
     ) -> Option<u64> {
-        if self.people.len() >= MAX_SIMULATED_PEOPLE
+        if self.people.len() >= people_cap()
             || self
                 .people
                 .iter()
@@ -1061,7 +1073,7 @@ impl TrafficSimulation {
         }
         self.dispatch_scheduled_trips(tower);
         self.spawn_accumulator += elapsed_seconds;
-        let population_limit = (usize::from(tower.star_rating()) * 32).min(MAX_SIMULATED_PEOPLE);
+        let population_limit = (usize::from(tower.star_rating()) * 32).min(people_cap());
         while self.spawn_accumulator >= self.next_spawn_seconds
             && self.people.len() < population_limit
         {
@@ -1134,7 +1146,7 @@ impl TrafficSimulation {
         for person in &mut self.away {
             person.visit_remaining -= elapsed_seconds;
         }
-        let room = MAX_SIMULATED_PEOPLE.saturating_sub(self.people.len());
+        let room = people_cap().saturating_sub(self.people.len());
         let mut due = 0;
         self.people.extend(self.away.extract_if(.., |person| {
             let returning = person.visit_remaining <= 0.0 && due < room;
@@ -1363,7 +1375,7 @@ impl TrafficSimulation {
             return;
         }
         self.last_resident_dispatch_bucket = bucket;
-        if self.people.len() >= MAX_SIMULATED_PEOPLE || !scheduled_trip_window_active(tower.clock) {
+        if self.people.len() >= people_cap() || !scheduled_trip_window_active(tower.clock) {
             return;
         }
 
@@ -1394,9 +1406,7 @@ impl TrafficSimulation {
                 continue;
             }
             for trip in scheduled_trip_specs(tower.clock, home, tower.star_rating()) {
-                if self.people.len() >= MAX_SIMULATED_PEOPLE
-                    || dispatched >= MAX_DISPATCHES_PER_BUCKET
-                {
+                if self.people.len() >= people_cap() || dispatched >= MAX_DISPATCHES_PER_BUCKET {
                     return;
                 }
                 let stamp_key = scheduled_trip_stamp_key(home.id, trip.event);

@@ -20,6 +20,32 @@ const LEAVING_LIMIT: f32 = 10.0;
 const MISSING_SHAFT_WAIT_LIMIT: f32 = 2.0;
 const IDLE_BESIDE_WAITER_LIMIT: f32 = 5.0;
 const LOADED_CAR_STILL_LIMIT: f32 = 20.0;
+/// Game minutes. The longest stay (a condo visit) is 12 game hours.
+const PRESENCE_LIMIT_MINUTES: u64 = 2 * 24 * 60;
+
+thread_local! {
+    static PEOPLE_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_SIMULATED_PEOPLE) };
+}
+
+/// The people cap the simulation uses on this thread (see `traffic::people_cap`).
+pub(super) fn people_cap() -> usize {
+    PEOPLE_CAP.get()
+}
+
+/// Lowers the people cap on this thread until dropped, so a small tower reaches the cap.
+pub(super) struct PeopleCap(usize);
+
+impl PeopleCap {
+    pub fn set(cap: usize) -> Self {
+        Self(PEOPLE_CAP.replace(cap))
+    }
+}
+
+impl Drop for PeopleCap {
+    fn drop(&mut self) {
+        PEOPLE_CAP.set(self.0);
+    }
+}
 
 pub(super) fn traffic_scale(speed: SimulationSpeed) -> f32 {
     match speed {
@@ -112,6 +138,12 @@ pub(super) struct Monitor {
     car_positions: HashMap<(u64, usize), f32>,
     loaded_car_still: HashMap<(u64, usize), f32>,
     since_route_check: Option<f32>,
+    /// Game minute each person was first seen in the tower in their current stay.
+    present_since: HashMap<u64, u64>,
+    reported: HashSet<(&'static str, u64)>,
+    /// Residents whose trip had ended at the previous check, and everyone away then.
+    due: HashSet<u64>,
+    away: HashSet<u64>,
 }
 
 impl Monitor {
@@ -124,7 +156,7 @@ impl Monitor {
         if let Err(error) = traffic.validate_save_state(tower) {
             flag("save validation fails", error);
         }
-        if traffic.people.len() > MAX_SIMULATED_PEOPLE {
+        if traffic.people.len() > people_cap() {
             flag(
                 "people over the cap",
                 format!("{} people", traffic.people.len()),
@@ -357,6 +389,62 @@ impl Monitor {
                 );
             }
         }
+        // Every stay ends: someone in the tower for days holds a slot for good, which a small
+        // cap turns into starvation. And residents whose trip has ended come back in ahead of
+        // anyone new: nobody new enters while a resident due at the last check is still out.
+        let now = tower.clock.absolute_minute();
+        let still_due = traffic
+            .away
+            .iter()
+            .filter(|person| person.visit_remaining <= 0.0 && self.due.contains(&person.id))
+            .map(|person| person.id)
+            .collect::<Vec<_>>();
+        if !still_due.is_empty() {
+            for newcomer in traffic.people.iter().filter(|person| {
+                !self.present_since.contains_key(&person.id) && !self.away.contains(&person.id)
+            }) {
+                if self.reported.insert(("newcomer", newcomer.id)) {
+                    flag(
+                        "newcomer ahead of a returning resident",
+                        format!(
+                            "person {} {:?} bound for {} came in while residents {still_due:?} were due back, {}/{} slots taken",
+                            newcomer.id,
+                            newcomer.role,
+                            newcomer.destination_facility_id,
+                            traffic.people.len(),
+                            people_cap()
+                        ),
+                    );
+                }
+            }
+        }
+        for person in &traffic.people {
+            let since = *self.present_since.entry(person.id).or_insert(now);
+            if now - since > PRESENCE_LIMIT_MINUTES && self.reported.insert(("stay", person.id)) {
+                flag(
+                    "person never leaves",
+                    format!(
+                        "person {} {:?} {:?} on floor {} for {} game minutes, bound for {} from {}",
+                        person.id,
+                        person.role,
+                        person.activity,
+                        person.current_floor,
+                        now - since,
+                        person.destination_facility_id,
+                        person.home_facility_id
+                    ),
+                );
+            }
+        }
+        self.present_since.retain(|id, _| alive.contains(id));
+        self.due = traffic
+            .away
+            .iter()
+            .filter(|person| person.visit_remaining <= 0.0)
+            .map(|person| person.id)
+            .collect();
+        self.away = traffic.away.iter().map(|person| person.id).collect();
+
         for clock in [
             &mut self.riding,
             &mut self.walking,
@@ -641,6 +729,26 @@ fn replay_saves() {
         let json = std::fs::read_to_string(path).expect("read save");
         let (mut tower, mut traffic) = load_save(&json).expect("load save");
         tower.clock.speed = speed;
+        // DISCOVERY_CAP replays under a lower people cap; frames run unchecked until the people
+        // already in the save drain below it.
+        let _cap = std::env::var("DISCOVERY_CAP").ok().map(|cap| {
+            let cap = PeopleCap::set(cap.parse().expect("DISCOVERY_CAP"));
+            let drain_start = tower.clock.absolute_minute();
+            while traffic.people.len() > people_cap() {
+                frame(&mut tower, &mut traffic, FRAME_SECONDS);
+                assert!(
+                    tower.clock.absolute_minute() - drain_start < 24 * 60,
+                    "{} people still over the cap after a day",
+                    traffic.people.len()
+                );
+            }
+            println!(
+                "   drained to {} people in {} game minutes",
+                traffic.people.len(),
+                tower.clock.absolute_minute() - drain_start
+            );
+            cap
+        });
         let start = tower.clock.absolute_minute();
         let end = start + (days * 24.0 * 60.0) as u64;
         print_unreachable(&tower, &traffic, path);
