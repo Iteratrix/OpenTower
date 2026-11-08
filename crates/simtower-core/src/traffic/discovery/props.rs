@@ -43,7 +43,7 @@ const MODES: [ElevatorMode; 3] = [
     ElevatorMode::ExpressToTop,
     ElevatorMode::ExpressToBottom,
 ];
-const KNOWN: [&str; 1] = ["shaft has a gap"];
+const KNOWN: [&str; 0] = [];
 
 /// Edits aim at existing structure (an anchor picked by index from the current state) so most
 /// of them are legal and land where traffic already flows; a few absolute placements keep
@@ -138,7 +138,7 @@ fn op_strategy(weights: [u32; 13]) -> BoxedStrategy<Op> {
         ),
         (
             weights[2],
-            (0..KINDS.len(), 0u16..WIDTH, -3i16..=16)
+            (0..KINDS.len(), 0u16..WIDTH, -4i16..=20)
                 .prop_map(|(kind, x, floor)| Op::PlaceAt { kind, x, floor })
                 .boxed(),
         ),
@@ -162,7 +162,7 @@ fn op_strategy(weights: [u32; 13]) -> BoxedStrategy<Op> {
         ),
         (
             weights[6],
-            (any::<usize>(), -3i16..=16)
+            (any::<usize>(), -4i16..=20)
                 .prop_map(|(pick, floor)| Op::AddCar { pick, floor })
                 .boxed(),
         ),
@@ -222,10 +222,13 @@ fn history() -> impl Strategy<Value = Vec<Op>> {
     })
 }
 
-/// Floors 1-10 across the site and 11-16 over its left part, a full ground lobby and a sky lobby
+/// Floors 1-10 across the site and 11-20 over its left part, a full ground lobby and a sky lobby
 /// on 15, a standard, a service and an express shaft, stairs up to floor 4 and from the sky
 /// lobby to 12 and 16, and tenants reachable directly, by stairs, and only through the sky
-/// lobby. Run three game hours at Tenfold so tenants move in.
+/// lobby. Each supported route shape also has a tenant that only it reaches, at its limit: a
+/// basement wing four stair flights down, another three escalator flights down, and an office
+/// on 20 reached by changing from the express to a second shaft at the sky lobby. Run three
+/// game hours at Tenfold so tenants move in.
 fn seeded_tower() -> (Tower, TrafficSimulation) {
     // The site is the standard width (loading widens narrower sites); building stays in 0..WIDTH.
     let mut tower = Tower::new(crate::DEFAULT_TOWER_WIDTH, 10_000_000_000);
@@ -234,9 +237,16 @@ fn seeded_tower() -> (Tower, TrafficSimulation) {
             tower.place_floor(GridPosition { x, floor }).unwrap();
         }
     }
-    for floor in 11..=16 {
+    for floor in 11..=20 {
         for x in 0..40 {
             tower.place_floor(GridPosition { x, floor }).unwrap();
+        }
+    }
+    for (floors, columns) in [(-4..=-1, 0..20), (-3..=-1, 40..62)] {
+        for floor in floors {
+            for x in columns.clone() {
+                tower.place_floor(GridPosition { x, floor }).unwrap();
+            }
         }
     }
     for x in 0..WIDTH {
@@ -272,6 +282,21 @@ fn seeded_tower() -> (Tower, TrafficSimulation) {
             .place(FacilityKind::Stairs, GridPosition { x: 16, floor })
             .unwrap();
     }
+    for floor in 15..=20 {
+        tower
+            .place(FacilityKind::Elevator, GridPosition { x: 28, floor })
+            .unwrap();
+    }
+    for floor in -4..=-1 {
+        tower
+            .place(FacilityKind::Stairs, GridPosition { x: 2, floor })
+            .unwrap();
+    }
+    for floor in -3..=-1 {
+        tower
+            .place(FacilityKind::Escalator, GridPosition { x: 44, floor })
+            .unwrap();
+    }
     for (kind, x, floor) in [
         (FacilityKind::Office, 24, 2),
         (FacilityKind::Office, 24, 4),
@@ -285,6 +310,9 @@ fn seeded_tower() -> (Tower, TrafficSimulation) {
         (FacilityKind::Condo, 2, 12),
         (FacilityKind::Office, 2, 16),
         (FacilityKind::HotelSingle, 2, 14),
+        (FacilityKind::Office, 2, 20),
+        (FacilityKind::Office, 10, -4),
+        (FacilityKind::Office, 52, -3),
     ] {
         tower.place(kind, GridPosition { x, floor }).unwrap();
     }
@@ -375,10 +403,7 @@ impl Run {
                 .map(|shaft| shaft.cars.len())
                 .sum::<usize>(),
         );
-        let result = self.apply_inner(step, op);
-        if result.is_err() {
-            return result;
-        }
+        self.apply_inner(step, op)?;
         let after = (
             self.tower.facilities().len(),
             self.tower.floors().len(),
@@ -426,7 +451,6 @@ impl Run {
         self.stats.shafts = self.traffic.elevators().len();
         self.stats.max_cars = self.stats.max_cars.max(after.2);
         self.stats.game_minutes = self.tower.clock.absolute_minute() - 8 * 60;
-        result?;
         if before.0 != after.0 || before.1 != after.1 {
             self.compare_with_rebuild(step, op)?;
         }
@@ -819,6 +843,22 @@ proptest! {
     }
 }
 
+/// The seed only exercises a route shape if the tenant placed for it is actually reached.
+#[test]
+fn the_seeded_tower_reaches_every_tenant() {
+    let (tower, traffic) = seeded_tower();
+    let unreached = tower
+        .facilities()
+        .iter()
+        .filter(|facility| {
+            facility.kind.has_tenant_occupancy()
+                && !traffic.reachable_facility_set().contains(&facility.id)
+        })
+        .map(|facility| (facility.kind, facility.position))
+        .collect::<Vec<_>>();
+    assert!(unreached.is_empty(), "{unreached:?}");
+}
+
 /// Prints what generated histories exercise. Run with
 /// cargo test --release -p simtower-core history_coverage -- --ignored --nocapture
 #[test]
@@ -859,7 +899,7 @@ fn history_coverage() {
         "frames {} (avg {}), game minutes avg {}, rider-frames {}",
         totals.frames,
         totals.frames / samples,
-        totals.game_minutes / samples as u64,
+        totals.game_minutes / samples,
         totals.rider_frames
     );
     println!(

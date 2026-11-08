@@ -88,7 +88,7 @@ pub(super) fn load_save(json: &str) -> Result<(Tower, TrafficSimulation), String
     tower.validate_save_state()?;
     traffic.validate_save_state(&tower)?;
     tower.expand_site_width(DEFAULT_TOWER_WIDTH);
-    traffic.sync_with_tower(&tower);
+    traffic.sync_with_loaded_tower(&tower);
     Ok((tower, traffic))
 }
 

@@ -290,7 +290,7 @@ impl<'a> Model<'a> {
 
     /// Whether someone starting on a ground lobby slice can walk to `x` on floor 1, and, when
     /// boarding `shaft`, from a slice whose lobby run touches it.
-    fn from_ground(&self, x: f32, shaft: Option<&ElevatorShaft>) -> bool {
+    fn reachable_from_ground(&self, x: f32, shaft: Option<&ElevatorShaft>) -> bool {
         let target = self.run(1, x);
         target.is_some()
             && self.ground_slices.iter().copied().any(|slice| {
@@ -311,20 +311,23 @@ impl<'a> Model<'a> {
         let goal = self.run(floor, x)?;
         let arrives = |via: f32| self.run(floor, via) == Some(goal);
         if floor == 1 {
-            return self.from_ground(x, None).then(|| "walk".to_owned());
+            return self
+                .reachable_from_ground(x, None)
+                .then(|| "walk".to_owned());
         }
         let columns = self.walkways.keys().copied().collect::<Vec<_>>();
         for &(kind, column) in &columns {
             let center = Self::walkway_center(kind, column);
             if self.walkway_leg(kind, column, 1, floor)
-                && self.from_ground(center, None)
+                && self.reachable_from_ground(center, None)
                 && arrives(center)
             {
                 return Some(format!("{kind:?} x{column}"));
             }
         }
         let boards = |shaft: &ElevatorShaft| {
-            self.stops(shaft, 1) && self.from_ground(Self::shaft_center(shaft), Some(shaft))
+            self.stops(shaft, 1)
+                && self.reachable_from_ground(Self::shaft_center(shaft), Some(shaft))
         };
         let alights =
             |shaft: &ElevatorShaft| self.stops(shaft, floor) && arrives(Self::shaft_center(shaft));
@@ -370,27 +373,27 @@ impl<'a> Model<'a> {
                         && self.run(level, Self::shaft_center(shaft)).is_some()
                         && self.run(level, Self::shaft_center(shaft)) == self.run(level, center)
                 };
-                if self.walkway_leg(kind, column, level, floor) && arrives(center) {
-                    for shaft in self
+                if self.walkway_leg(kind, column, level, floor)
+                    && arrives(center)
+                    && let Some(shaft) = self
                         .public_shafts()
-                        .filter(|shaft| boards(shaft) && changes(shaft))
-                    {
-                        return Some(format!(
-                            "{:?} x{} to {level}, {kind:?} x{column}",
-                            shaft.kind, shaft.x
-                        ));
-                    }
+                        .find(|shaft| boards(shaft) && changes(shaft))
+                {
+                    return Some(format!(
+                        "{:?} x{} to {level}, {kind:?} x{column}",
+                        shaft.kind, shaft.x
+                    ));
                 }
-                if self.walkway_leg(kind, column, 1, level) && self.from_ground(center, None) {
-                    for shaft in self
+                if self.walkway_leg(kind, column, 1, level)
+                    && self.reachable_from_ground(center, None)
+                    && let Some(shaft) = self
                         .public_shafts()
-                        .filter(|shaft| alights(shaft) && changes(shaft))
-                    {
-                        return Some(format!(
-                            "{kind:?} x{column} to {level}, {:?} x{}",
-                            shaft.kind, shaft.x
-                        ));
-                    }
+                        .find(|shaft| alights(shaft) && changes(shaft))
+                {
+                    return Some(format!(
+                        "{kind:?} x{column} to {level}, {:?} x{}",
+                        shaft.kind, shaft.x
+                    ));
                 }
             }
         }
