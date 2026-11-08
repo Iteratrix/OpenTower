@@ -2248,7 +2248,13 @@ impl App {
 
     fn save_named(&self, name: &str) -> Result<SavedGameLocation, String> {
         let filename = sanitized_save_filename(name)?;
-        let save = SaveGame {
+        let bytes = serde_json::to_vec_pretty(&self.save_game())
+            .map_err(|error| format!("Could not encode the save game: {error}"))?;
+        write_save_game(&filename, &bytes)
+    }
+
+    fn save_game(&self) -> SaveGame {
+        SaveGame {
             format_version: SAVE_FORMAT_VERSION,
             tower: self.tower.clone(),
             traffic: self.traffic.clone(),
@@ -2273,10 +2279,7 @@ impl App {
             last_vip_attempt_day: self.last_vip_attempt_day,
             bomb_event: self.bomb_event,
             recycling_state: self.recycling_state.clone(),
-        };
-        let bytes = serde_json::to_vec_pretty(&save)
-            .map_err(|error| format!("Could not encode the save game: {error}"))?;
-        write_save_game(&filename, &bytes)
+        }
     }
 
     fn load_from_picker(&mut self) {
@@ -3483,6 +3486,10 @@ impl App {
     }
 
     fn center_camera_on_facility(&mut self, facility_id: u64) {
+        // Headless discovery runs have no window to measure.
+        if cfg!(test) {
+            return;
+        }
         let Some(facility) = self
             .tower
             .facilities()
@@ -14081,6 +14088,9 @@ async fn main() {
         next_frame().await;
     }
 }
+
+#[cfg(test)]
+mod discovery;
 
 #[cfg(test)]
 mod tests {
