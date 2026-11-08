@@ -989,6 +989,7 @@ impl Tower {
             }
         }
         self.check_facility_limit(kind, position)?;
+        self.check_shaft_continuity(kind, position)?;
         if (position.x..position.x + spec.width).any(|x| {
             !self.has_floor(GridPosition {
                 x,
@@ -1052,6 +1053,34 @@ impl Tower {
             return Err(PlacementError::Occupied);
         }
         Ok(())
+    }
+
+    /// A shaft is one unbroken span of floors, as in the original, where a
+    /// carrier is only extended or trimmed at its ends. Traffic groups every
+    /// same-type segment in a column into one shaft, so a detached segment
+    /// would let cars run through the floors between the two pieces.
+    fn check_shaft_continuity(
+        &self,
+        kind: FacilityKind,
+        position: GridPosition,
+    ) -> Result<(), PlacementError> {
+        let column_has_shaft = self.facilities.iter().any(|facility| {
+            facility.kind == kind
+                && facility.position.x == position.x
+                && facility.position.floor != position.floor
+        });
+        if is_shaft_kind(kind) && column_has_shaft && !self.is_elevator_extension(kind, position) {
+            return Err(PlacementError::DetachedShaftSegment);
+        }
+        Ok(())
+    }
+
+    fn has_shaft_segment(&self, kind: FacilityKind, x: u16, ordinal: i16) -> bool {
+        self.facilities.iter().any(|facility| {
+            facility.kind == kind
+                && facility.position.x == x
+                && floor_ordinal(facility.position.floor) == ordinal
+        })
     }
 
     fn check_facility_limit(
@@ -1318,8 +1347,17 @@ impl Tower {
             .iter()
             .position(|facility| facility.id == id)
             .ok_or(DemolitionError::UnknownFacility(id))?;
-        if self.facilities[index].kind == FacilityKind::Lobby {
+        let target = &self.facilities[index];
+        if target.kind == FacilityKind::Lobby {
             return Err(DemolitionError::LobbyIsPermanent);
+        }
+        if is_shaft_kind(target.kind) {
+            let ordinal = floor_ordinal(target.position.floor);
+            if self.has_shaft_segment(target.kind, target.position.x, ordinal - 1)
+                && self.has_shaft_segment(target.kind, target.position.x, ordinal + 1)
+            {
+                return Err(DemolitionError::ShaftMiddleSegment);
+            }
         }
         let removed = self.facilities.remove(index);
         if removed.kind == FacilityKind::Cathedral && !self.tower_status_awarded {
@@ -1542,6 +1580,13 @@ fn tenant_move_in_minute(clock: Clock, kind: FacilityKind, facility_id: u64) -> 
     current + base_delay + jitter
 }
 
+const fn is_shaft_kind(kind: FacilityKind) -> bool {
+    matches!(
+        kind,
+        FacilityKind::Elevator | FacilityKind::ServiceElevator | FacilityKind::ExpressElevator
+    )
+}
+
 const fn is_transport_kind(kind: FacilityKind) -> bool {
     matches!(
         kind,
@@ -1573,6 +1618,7 @@ pub enum PlacementError {
     SingleRampColumn,
     RecyclingUndergroundOnly,
     RecyclingCentersMustBeAdjacent,
+    DetachedShaftSegment,
 }
 
 impl fmt::Display for PlacementError {
@@ -1635,6 +1681,9 @@ impl fmt::Display for PlacementError {
                     "additional recycling centers must touch an existing center"
                 )
             }
+            Self::DetachedShaftSegment => {
+                write!(f, "extend the shaft from its top or bottom floor")
+            }
         }
     }
 }
@@ -1648,6 +1697,7 @@ pub enum DemolitionError {
     UnknownFloor(GridPosition),
     FloorOccupied(GridPosition),
     FloorSupportsAbove { position: GridPosition, above: i16 },
+    ShaftMiddleSegment,
 }
 
 impl fmt::Display for DemolitionError {
@@ -1670,6 +1720,9 @@ impl fmt::Display for DemolitionError {
                 "floor {}, column {} is holding up floor {above}",
                 position.floor, position.x
             ),
+            Self::ShaftMiddleSegment => {
+                write!(f, "shorten the shaft from its top or bottom floor")
+            }
         }
     }
 }
@@ -2315,6 +2368,65 @@ mod tests {
         assert_eq!(elevator_car_cost(FacilityKind::Elevator), 80_000);
         assert_eq!(elevator_car_cost(FacilityKind::ServiceElevator), 50_000);
         assert_eq!(elevator_car_cost(FacilityKind::ExpressElevator), 150_000);
+    }
+
+    #[test]
+    fn a_shaft_can_only_be_shortened_from_its_ends() {
+        let mut tower = Tower::new(16, 10_000_000);
+        build_supported_floor(&mut tower, 5, 0..4);
+        let segments = (1..=5)
+            .map(|floor| {
+                tower
+                    .place(FacilityKind::Elevator, GridPosition { x: 0, floor })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            tower.demolish(segments[2]),
+            Err(DemolitionError::ShaftMiddleSegment)
+        );
+        assert_eq!(tower.facilities().len(), 5);
+        tower.demolish(segments[4]).unwrap();
+        tower.demolish(segments[0]).unwrap();
+        assert_eq!(
+            tower.demolish(segments[2]),
+            Err(DemolitionError::ShaftMiddleSegment)
+        );
+        tower.demolish(segments[3]).unwrap();
+        tower.demolish(segments[2]).unwrap();
+        tower.demolish(segments[1]).unwrap();
+        assert!(tower.facilities().is_empty());
+    }
+
+    #[test]
+    fn a_detached_segment_cannot_join_the_shaft_in_its_column() {
+        let mut tower = Tower::new(16, 10_000_000);
+        build_supported_floor(&mut tower, 5, 0..4);
+        for floor in [-1, -2] {
+            for x in 0..4 {
+                tower.place_floor(GridPosition { x, floor }).unwrap();
+            }
+        }
+        for floor in 1..=2 {
+            tower
+                .place(FacilityKind::Elevator, GridPosition { x: 0, floor })
+                .unwrap();
+        }
+
+        for floor in [5, -2] {
+            assert_eq!(
+                tower.place(FacilityKind::Elevator, GridPosition { x: 0, floor }),
+                Err(PlacementError::DetachedShaftSegment),
+                "floor {floor}"
+            );
+        }
+        for floor in [3, 4, 5, -1, -2] {
+            tower
+                .place(FacilityKind::Elevator, GridPosition { x: 0, floor })
+                .unwrap();
+        }
+        assert_eq!(tower.facilities().len(), 7);
     }
 
     #[test]
