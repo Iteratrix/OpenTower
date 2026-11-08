@@ -834,6 +834,11 @@ proptest! {
         let (tower, traffic) = load_save(&json).map_err(TestCaseError::fail)?;
         reloaded.tower = tower;
         reloaded.traffic = traffic;
+        // Loading rebuilds shafts and routes in full, while construction only routes tenants that
+        // had none, so a reload can replace a route that a later addition made second-best. Give
+        // the uninterrupted run the same rebuild: the property is that a save keeps everything
+        // else.
+        run.traffic.sync_with_loaded_tower(&run.tower);
         for _ in 0..frames {
             frame(&mut run.tower, &mut run.traffic, FRAME_SECONDS);
             frame(&mut reloaded.tower, &mut reloaded.traffic, FRAME_SECONDS);
