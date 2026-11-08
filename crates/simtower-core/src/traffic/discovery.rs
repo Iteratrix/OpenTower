@@ -9,6 +9,7 @@ use crate::{DEFAULT_TOWER_WIDTH, Facility, SimulationSpeed, Tower};
 
 mod fuzz;
 mod props;
+mod reach;
 
 pub(super) const FRAME_SECONDS: f32 = 1.0 / 60.0;
 
@@ -475,6 +476,31 @@ impl Monitor {
                 flag("reachable without a route", format!("facility {id}"));
             }
         }
+        let (unrouted, cut_off) = reach::Model::new(tower, traffic).audit(traffic);
+        for (tenant, verdict) in unrouted {
+            if let reach::Verdict::RouterMissed(shape) = verdict {
+                flag(
+                    "router misses a supported route",
+                    format!(
+                        "{:?} {} on floor {} at x{}: {shape}",
+                        tenant.kind, tenant.id, tenant.position.floor, tenant.position.x
+                    ),
+                );
+            }
+        }
+        for tenant in cut_off {
+            flag(
+                "routed tenant is cut off",
+                format!(
+                    "{:?} {} on floor {} at x{} via {:?}",
+                    tenant.kind,
+                    tenant.id,
+                    tenant.position.floor,
+                    tenant.position.x,
+                    traffic.routes_from_lobby.get(&tenant.id)
+                ),
+            );
+        }
         found
     }
 }
@@ -617,6 +643,7 @@ fn replay_saves() {
         tower.clock.speed = speed;
         let start = tower.clock.absolute_minute();
         let end = start + (days * 24.0 * 60.0) as u64;
+        print_unreachable(&tower, &traffic, path);
         let mut monitor = Monitor::default();
         let mut report = Report::default();
         report.add(0.0, monitor.check(&tower, &traffic, 0.0));
@@ -626,6 +653,40 @@ fn replay_saves() {
             report.add(monitor.elapsed, violations);
         }
         report.print(&format!("{path} at {speed:?} for {days} days"));
+    }
+}
+
+/// Lists the tenants the router leaves unreachable, grouped by the oracle's verdict.
+fn print_unreachable(tower: &Tower, traffic: &TrafficSimulation, label: &str) {
+    let (unrouted, _) = reach::Model::new(tower, traffic).audit(traffic);
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (tenant, verdict) in unrouted {
+        let place = format!(
+            "{:?} {} floor {} x{}",
+            tenant.kind, tenant.id, tenant.position.floor, tenant.position.x
+        );
+        let (group, detail) = match verdict {
+            reach::Verdict::RouterMissed(shape) => (
+                "router missed a supported route".to_owned(),
+                format!("{place}: {shape}"),
+            ),
+            reach::Verdict::DesignGap { category, path } => (
+                format!("design gap: {category}"),
+                format!("{place}: {path}"),
+            ),
+            reach::Verdict::CutOff => ("not connected".to_owned(), place),
+        };
+        groups.entry(group).or_default().push(detail);
+    }
+    println!(
+        "== {label}: {} unreachable tenants",
+        groups.values().map(Vec::len).sum::<usize>()
+    );
+    for (group, details) in groups {
+        println!("  {group}: {}", details.len());
+        for detail in details.iter().take(8) {
+            println!("      {detail}");
+        }
     }
 }
 
